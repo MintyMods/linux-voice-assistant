@@ -24,3 +24,6 @@ venv/
 dev.env
 version.txt
 version_githash.txt
+
+# Custom Calisto wakewords (private)
+/wakewords/custom/

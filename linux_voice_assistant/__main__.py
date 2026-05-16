@@ -388,6 +388,12 @@ async def main() -> None:
     )
     process_audio_thread.start()
 
+    # MQTT cancel side-channel — lets an external trigger (red Calisto button
+    # via led_service.py, HA automation) abort the current voice pipeline
+    # without restarting the process. The native ESPHome protocol has no
+    # inbound abort message, so this is the cleanest cross-process hook.
+    _start_mqtt_cancel_subscriber(state, loop)
+
     # Auto discovery (zeroconf, mDNS)
     discovery = HomeAssistantZeroconf(port=args.port, name=state.name, mac_address=state.mac_address, host_ip_address=host_ip_address)
     await discovery.register_server()
@@ -406,6 +412,59 @@ async def main() -> None:
 
 
 # -----------------------------------------------------------------------------
+
+
+def _start_mqtt_cancel_subscriber(state: ServerState, loop: asyncio.AbstractEventLoop) -> None:
+    import os
+    host = os.environ.get("LVA_MQTT_HOST")
+    if not host:
+        _LOGGER.info("LVA_MQTT_HOST not set; voice-cancel MQTT subscriber disabled")
+        return
+    room = os.environ.get("LVA_ROOM", "lounge")
+    port = int(os.environ.get("LVA_MQTT_PORT", "1883"))
+    topic = f"calisto/{room}/voice/cancel"
+
+    try:
+        import paho.mqtt.client as mqtt  # type: ignore
+    except ImportError:
+        _LOGGER.error("paho-mqtt not installed; voice-cancel subscriber disabled")
+        return
+
+    def _cancel_pipeline() -> None:
+        sat = state.satellite
+        if sat is None:
+            _LOGGER.debug("voice/cancel received but no satellite connected; nothing to abort")
+            return
+        try:
+            sat.stop()
+            _LOGGER.info("voice pipeline aborted via MQTT cancel")
+        except Exception:
+            _LOGGER.exception("satellite.stop() raised during MQTT cancel")
+
+    def _on_connect(c, _ud, _flags, rc, _props=None):
+        if rc == 0:
+            c.subscribe(topic, qos=1)
+            _LOGGER.info("MQTT cancel subscriber connected to %s:%d, subscribed to %s", host, port, topic)
+        else:
+            _LOGGER.error("MQTT cancel subscriber connect failed rc=%s", rc)
+
+    def _on_message(_c, _ud, msg):
+        _LOGGER.debug("MQTT cancel msg topic=%s payload=%r", msg.topic, msg.payload)
+        loop.call_soon_threadsafe(_cancel_pipeline)
+
+    client = mqtt.Client(
+        mqtt.CallbackAPIVersion.VERSION2,  # type: ignore[attr-defined]
+        client_id=f"lva-cancel-{room}",
+        clean_session=True,
+    )
+    client.on_connect = _on_connect
+    client.on_message = _on_message
+    client.reconnect_delay_set(min_delay=1, max_delay=30)
+    try:
+        client.connect_async(host, port, keepalive=60)
+        client.loop_start()
+    except Exception:
+        _LOGGER.exception("MQTT cancel subscriber failed to start")
 
 
 def process_audio(state: ServerState, mic, block_size: int):
