@@ -680,6 +680,7 @@ class VoiceSatelliteProtocol(APIServer):
         # phases left _is_streaming_audio=True so we kept sending mic audio
         # to HA, the pipeline ran to completion, and TTS played anyway.
         # Now: kill streaming, drop any pending TTS, unduck unconditionally.
+        was_streaming = self._is_streaming_audio
         self.state.active_wake_words.discard(self.state.stop_word.id)
         self._pipeline_active = False
         self._is_streaming_audio = False
@@ -690,6 +691,16 @@ class VoiceSatelliteProtocol(APIServer):
         if self._timer_finished:
             self._timer_finished = False
             self._timer_ring_start = None
+
+        # Tell HA the audio stream is over so its pipeline_run exits cleanly
+        # rather than waiting for VAD timeout (which would leave the
+        # assist_satellite state stuck on "listening" — visible as the
+        # Calisto LEDs continuing to indicate listening).
+        if was_streaming:
+            try:
+                self.send_messages([VoiceAssistantAudio(data=b"", end=True)])
+            except Exception:
+                _LOGGER.exception("Failed to send stream-end on abort")
 
         self.unduck()
         self.state.tts_player.stop()
