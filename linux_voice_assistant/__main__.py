@@ -432,6 +432,8 @@ def _start_mqtt_cancel_subscriber(state: ServerState, loop: asyncio.AbstractEven
         _LOGGER.error("paho-mqtt not installed; voice-cancel subscriber disabled")
         return
 
+    cancel_beep = str(_SOUNDS_DIR / "mute_switch_on.flac")
+
     def _cancel_pipeline() -> None:
         sat = state.satellite
         if sat is None:
@@ -442,6 +444,13 @@ def _start_mqtt_cancel_subscriber(state: ServerState, loop: asyncio.AbstractEven
             _LOGGER.info("voice pipeline aborted via MQTT cancel")
         except Exception:
             _LOGGER.exception("satellite.stop() raised during MQTT cancel")
+        # Audible feedback that the cancel was received, regardless of what
+        # phase the pipeline was in. Played on tts_player AFTER stop() (which
+        # itself calls tts_player.stop()) so it survives the abort.
+        try:
+            loop.call_later(0.15, lambda: state.tts_player.play(cancel_beep))
+        except Exception:
+            _LOGGER.exception("cancel beep schedule failed")
 
     def _on_connect(c, _ud, _flags, rc, _props=None):
         if rc == 0:

@@ -661,6 +661,12 @@ class VoiceSatelliteProtocol(APIServer):
 
     def _on_wakeup_sound_finished(self, wake_word_phrase: str) -> None:
         """Callback invoked when the wakeup sound finishes playing."""
+        if not self._pipeline_active:
+            # An external abort fired between wake-detect and chime-finish.
+            # tts_player.stop() invokes this done_callback; without the guard
+            # we would restart streaming immediately after the abort.
+            _LOGGER.debug("Wakeup sound finished but pipeline aborted; not starting stream")
+            return
         _LOGGER.debug("Wakeup sound finished, starting audio streaming with wake word: %s", wake_word_phrase)
         self.send_messages(
             [VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)],
@@ -668,23 +674,35 @@ class VoiceSatelliteProtocol(APIServer):
         self._is_streaming_audio = True
 
     def stop(self) -> None:
+        # Full pipeline abort. Original implementation only stopped TTS
+        # playback, which works ONLY if we're already in the TTS phase.
+        # Pressing the panic button during wake-chime / listen / think
+        # phases left _is_streaming_audio=True so we kept sending mic audio
+        # to HA, the pipeline ran to completion, and TTS played anyway.
+        # Now: kill streaming, drop any pending TTS, unduck unconditionally.
         self.state.active_wake_words.discard(self.state.stop_word.id)
         self._pipeline_active = False
+        self._is_streaming_audio = False
+        self._tts_url = None
+        self._tts_played = False
+        self._continue_conversation = False
 
         if self._timer_finished:
             self._timer_finished = False
             self._timer_ring_start = None
-            self.unduck()
-            self.state.tts_player.stop()
-            _LOGGER.debug("Stopping timer finished sound")
-        else:
-            # tts_player.stop() invokes the done_callback (_tts_finished),
-            # so we don't call _tts_finished() again explicitly.
-            self.state.tts_player.stop()
-            _LOGGER.debug("TTS response stopped manually")
+
+        self.unduck()
+        self.state.tts_player.stop()
+        _LOGGER.debug("Pipeline aborted: streaming stopped, TTS dropped, unducked")
 
     def play_tts(self) -> None:
         if (not self._tts_url) or self._tts_played:
+            return
+        if not self._pipeline_active:
+            # Pipeline was aborted between intent-end and TTS-arrival.
+            # Drop the TTS instead of speaking after a cancel.
+            _LOGGER.debug("Suppressing TTS playback: pipeline not active (aborted)")
+            self._tts_url = None
             return
 
         self._tts_played = True
