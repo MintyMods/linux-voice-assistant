@@ -422,6 +422,8 @@ def _start_mqtt_cancel_subscriber(state: ServerState, loop: asyncio.AbstractEven
         return
     room = os.environ.get("LVA_ROOM", "lounge")
     port = int(os.environ.get("LVA_MQTT_PORT", "1883"))
+    username = os.environ.get("LVA_MQTT_USER") or None
+    password = os.environ.get("LVA_MQTT_PASS") or None
     topic = f"calisto/{room}/voice/cancel"
 
     try:
@@ -457,6 +459,8 @@ def _start_mqtt_cancel_subscriber(state: ServerState, loop: asyncio.AbstractEven
         client_id=f"lva-cancel-{room}",
         clean_session=True,
     )
+    if username:
+        client.username_pw_set(username, password)
     client.on_connect = _on_connect
     client.on_message = _on_message
     client.reconnect_delay_set(min_delay=1, max_delay=30)
