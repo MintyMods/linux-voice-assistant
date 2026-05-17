@@ -142,12 +142,24 @@ class DeviceSession:
 
         # Mirror back to satellite for back-compat reads (Stage A tests + any
         # callers still reading sat._state_label / sat._session_id directly).
+        # On entry to IDLE also reset v0-legacy lifecycle flags. _pipeline_active
+        # is set in satellite.wakeup() and cleared by sat.stop() / _tts_finished
+        # on the v0 path; the v1 (B3) path drives the turn through DS._run_turn
+        # and never clears it, so wake → no_speech / empty_reply / reply_done
+        # used to leave _pipeline_active=True and silently swallow every
+        # subsequent wake at satellite.wakeup() L764. Resetting here makes
+        # _pipeline_active derived from "DS.state == IDLE".
         sat = getattr(self.state, "satellite", None)
         if sat is not None:
             try:
                 sat._state_label = target.value
                 sat._session_id = self._session_id
                 sat._last_state_change_ts = self._last_change_ts
+                if target == State.IDLE:
+                    sat._pipeline_active = False
+                    sat._is_streaming_audio = False
+                    sat._ha_pipeline_started = False
+                    sat._continue_conversation = False
             except AttributeError:
                 pass
 

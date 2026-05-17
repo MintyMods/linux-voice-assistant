@@ -8,6 +8,7 @@ client wired by `fake_paho` (top-level conftest) — no real broker.
 from __future__ import annotations
 
 import json
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -203,6 +204,51 @@ def test_device_session_no_habridge_is_safe():
     ds.transition_to(State.LISTENING)
     ds.transition_to(State.IDLE)
     assert state.device_state == "IDLE"
+
+
+def test_transition_to_idle_clears_v0_pipeline_flags_on_satellite():
+    """Regression: pre-fix, sat._pipeline_active was set True in wakeup() and
+    only cleared by sat.stop() / v0 _tts_finished. The v1 (B3) path drives
+    turns via DS._run_turn, so no_speech / empty_reply / reply_done all left
+    _pipeline_active=True and the next wake bailed at satellite.wakeup() L764
+    ('Ignoring wake word - pipeline already active'). This test pins that
+    every DS IDLE transition resets the v0-legacy flags on the satellite."""
+    state = _make_state()
+    sat = MagicMock()
+    sat._pipeline_active = True
+    sat._is_streaming_audio = True
+    sat._ha_pipeline_started = True
+    sat._continue_conversation = True
+    state.satellite = sat
+
+    ds = DeviceSession(state, ha_bridge=None)
+    ds.transition_to(State.WAKING)
+    ds.transition_to(State.LISTENING)
+    # Simulate the no_speech path: DS goes back to IDLE directly.
+    ds.transition_to(State.IDLE, reason="no_speech")
+
+    assert sat._pipeline_active is False, "next wake would silently bail in wakeup()"
+    assert sat._is_streaming_audio is False
+    assert sat._ha_pipeline_started is False
+    assert sat._continue_conversation is False
+
+
+def test_transition_to_non_idle_does_not_clear_v0_pipeline_flags():
+    """Sanity: clearing must be IDLE-entry only, not every transition (else a
+    WAKING→LISTENING transition would clear the flag set by wakeup()).
+    """
+    state = _make_state()
+    sat = MagicMock()
+    sat._pipeline_active = True
+    sat._is_streaming_audio = True
+    state.satellite = sat
+
+    ds = DeviceSession(state, ha_bridge=None)
+    ds.transition_to(State.WAKING)
+    ds.transition_to(State.LISTENING)
+
+    assert sat._pipeline_active is True
+    assert sat._is_streaming_audio is True
 
 
 # ---- Satellite shim integration -------------------------------------------
