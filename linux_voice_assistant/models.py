@@ -135,6 +135,15 @@ class ServerState:
     mqtt_client: Any = None
     mqtt_state_topic: Optional[str] = None
 
+    # Stage B — DeviceSession + bridge wiring (O.4). All Any-typed to avoid
+    # an import cycle through the dataclass annotations.
+    device_session: Any = None
+    bridge_client: Any = None
+    asr_client: Any = None
+    ha_bridge: Any = None
+    session_id: Optional[str] = None
+    device_state: str = "IDLE"
+
     def save_preferences(self) -> None:
         """Save preferences as JSON."""
         _LOGGER.debug("Saving preferences: %s", self.preferences_path)

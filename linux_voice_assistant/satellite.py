@@ -352,6 +352,16 @@ class VoiceSatelliteProtocol(APIServer):
     # ------------------------------------------------------------------
 
     def _bump_gen(self) -> int:
+        # Stage B — DeviceSession is the source of truth when wired. Fall back
+        # to the local counter for cold-start (the VoiceSatelliteProtocol
+        # validation in __main__.py runs before DeviceSession is constructed)
+        # and for Stage A unit tests that bypass __init__.
+        ds = getattr(self.state, "device_session", None)
+        if ds is not None:
+            gen = ds.bump_gen()
+            self._generation = gen
+            self._last_state_change_ts = time.monotonic()
+            return gen
         with self._gen_lock:
             self._generation += 1
             self._last_state_change_ts = time.monotonic()
@@ -359,12 +369,38 @@ class VoiceSatelliteProtocol(APIServer):
             return self._generation
 
     def _gen_check(self, captured: int) -> bool:
+        ds = getattr(self.state, "device_session", None)
+        if ds is not None:
+            return ds.gen_check(captured)
         return captured == self._generation
 
-    def _set_state_label(self, new_state: str) -> None:
+    def _set_state_label(
+        self,
+        new_state: str,
+        *,
+        reason: str = "transition",
+        cancel_reason: Optional[str] = None,
+    ) -> None:
+        """Single state-transition dispatcher.
+
+        With DeviceSession attached: route through DS.transition_to which
+        mints/clears session_id, mirrors fields back to self, and publishes
+        K.1 via HABridge.
+
+        Without DeviceSession (cold-start, Stage A unit tests): update self
+        in place. When `reason != "transition"` (cancel paths) also call the
+        legacy `_publish_session_state` so K.1 still goes out via the cancel
+        subscriber's mqtt_client when one is wired.
+        """
+        ds = getattr(self.state, "device_session", None)
+        if ds is not None:
+            ds.transition_to(new_state, reason=reason, cancel_reason=cancel_reason)
+            return
         if new_state != self._state_label:
             self._state_label = new_state
             self._last_state_change_ts = time.monotonic()
+        if reason != "transition":
+            self._publish_session_state(reason=reason, cancel_reason=cancel_reason)
 
     def _publish_session_state(self, *, reason: str, cancel_reason: Optional[str]) -> None:
         """Publish K.1 calisto/<room>/session/state. Fire-and-forget."""
@@ -814,11 +850,13 @@ class VoiceSatelliteProtocol(APIServer):
         self.unduck()
         self.state.tts_player.stop()
 
-        self._set_state_label("IDLE")
-        self._session_id = None
         self.state.last_cancel_reason = cancel_reason
         self.state.last_cancel_ts = time.time()
-        self._publish_session_state(reason="cancel_force", cancel_reason=cancel_reason)
+        # Single canonical transition publish — DeviceSession (Stage B) routes
+        # through HABridge with reason=cancel_force; cold-start/Stage-A
+        # fallback fires the legacy _publish_session_state via the same call.
+        self._set_state_label("IDLE", reason="cancel_force", cancel_reason=cancel_reason)
+        self._session_id = None
 
         _LOGGER.debug("Pipeline aborted: HA release sequence sent, TTS dropped, unducked (reason=%s)", cancel_reason)
 

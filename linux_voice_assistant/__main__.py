@@ -18,9 +18,12 @@ from getmac import get_mac_address  # type: ignore
 from pymicro_wakeword import MicroWakeWord, MicroWakeWordFeatures
 from pyopen_wakeword import OpenWakeWord, OpenWakeWordFeatures
 
+from .bridge_client import BridgeClient
+from .ha_bridge import HABridge
 from .models import Preferences, ServerState
 from .mpv_player import MpvMediaPlayer
 from .satellite import VoiceSatelliteProtocol
+from .session import DeviceSession
 from .util import (
     get_default_interface,
     get_default_ipv4,
@@ -394,6 +397,12 @@ async def main() -> None:
     # inbound abort message, so this is the cleanest cross-process hook.
     _start_mqtt_cancel_subscriber(state, loop)
 
+    # Stage B — DeviceSession + HABridge + BridgeClient. The satellite still
+    # drives the v0 HA pipeline in B2; DeviceSession is a parallel state
+    # holder + K.1 publisher. BridgeClient is constructed but not called from
+    # any code path in B2 (B3 wires the audio path through it).
+    _start_stage_b_components(state, loop)
+
     # Auto discovery (zeroconf, mDNS)
     discovery = HomeAssistantZeroconf(port=args.port, name=state.name, mac_address=state.mac_address, host_ip_address=host_ip_address)
     await discovery.register_server()
@@ -524,6 +533,96 @@ def _start_mqtt_cancel_subscriber(state: ServerState, loop: asyncio.AbstractEven
         state.mqtt_state_topic = state_topic
     except Exception:
         _LOGGER.exception("MQTT cancel subscriber failed to start")
+
+
+def _parse_mqtt_broker(url: str) -> tuple:
+    """Parse `mqtt://host:port` into (host, port). Returns (host, 1883) on failure."""
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(url if "://" in url else f"mqtt://{url}")
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 1883
+        return host, port
+    except Exception:
+        return "127.0.0.1", 1883
+
+
+def _start_stage_b_components(state: ServerState, loop: asyncio.AbstractEventLoop) -> None:
+    """Construct DeviceSession + HABridge + BridgeClient and attach to state.
+
+    Env vars (per M.5; LVA_MQTT_* names retained as fallback for v0 deploys):
+      ROOM                       — device room slug
+      MQTT_BROKER | LVA_MQTT_HOST/PORT — broker host:port
+      MQTT_USER   | LVA_MQTT_USER     — broker username (optional)
+      MQTT_PASSWORD | LVA_MQTT_PASS   — broker password (optional)
+      BRIDGE_URL                 — claude-bridge base URL (optional in B2)
+      STATE_REASSERT_INTERVAL_S  — Stage F (read into state for future use)
+      HEARTBEAT_INTERVAL_S       — Stage F (read into state for future use)
+
+    All components are best-effort: missing env vars produce log warnings
+    and disable that component; the satellite still runs the v0 wire path.
+    """
+    import os
+
+    room = os.environ.get("ROOM", state.room or "lounge")
+    state.room = room
+
+    # MQTT broker resolution: M.5 form takes priority.
+    broker_url = os.environ.get("MQTT_BROKER")
+    if broker_url:
+        host, port = _parse_mqtt_broker(broker_url)
+    else:
+        host = os.environ.get("LVA_MQTT_HOST", "")
+        port = int(os.environ.get("LVA_MQTT_PORT", "1883"))
+    username = os.environ.get("MQTT_USER") or os.environ.get("LVA_MQTT_USER") or None
+    password = os.environ.get("MQTT_PASSWORD") or os.environ.get("LVA_MQTT_PASS") or None
+
+    ha_bridge: Optional[HABridge] = None
+    if host:
+        ha_bridge = HABridge(
+            room=room,
+            host=host,
+            port=port,
+            username=username,
+            password=password,
+        )
+        try:
+            ha_bridge.start()
+            state.ha_bridge = ha_bridge
+        except Exception:
+            _LOGGER.exception("HABridge.start failed; K.1 publishes disabled")
+            ha_bridge = None
+    else:
+        _LOGGER.info("No MQTT broker configured; HABridge disabled (K.1 publishes off)")
+
+    # DeviceSession wraps the satellite once state is wired. Constructing it
+    # attaches it to state.device_session, after which the satellite shim
+    # routes _bump_gen / _set_state_label through it.
+    session = DeviceSession(state, ha_bridge=ha_bridge)
+    # Publish initial STARTING then IDLE per K.1.3 (startup transition).
+    session.transition_to("STARTING", reason="startup")
+    session.transition_to("IDLE", reason="startup")
+
+    # BridgeClient — built but not used by any code path in B2. Stage B3
+    # wires audio capture → ASR → BridgeClient.chat. Tests construct their
+    # own client; production simply has it ready.
+    bridge_url = os.environ.get("BRIDGE_URL")
+    if bridge_url:
+        try:
+            state.bridge_client = BridgeClient(bridge_url, device_session=session)
+            _LOGGER.info("BridgeClient initialised for %s (B2: idle; B3 wires audio path)", bridge_url)
+        except Exception:
+            _LOGGER.exception("BridgeClient construction failed")
+    else:
+        _LOGGER.info("BRIDGE_URL not set; BridgeClient disabled (Stage B3 dependency)")
+
+    # Stage F placeholders — surfaced into logs so deploy-time misconfigs
+    # are visible before F lands the watchdog/heartbeat code.
+    _LOGGER.info(
+        "Stage F env (read but unused in B2): STATE_REASSERT_INTERVAL_S=%s HEARTBEAT_INTERVAL_S=%s",
+        os.environ.get("STATE_REASSERT_INTERVAL_S", "30"),
+        os.environ.get("HEARTBEAT_INTERVAL_S", "60"),
+    )
 
 
 def process_audio(state: ServerState, mic, block_size: int):

@@ -34,6 +34,10 @@ def _make_bare_satellite() -> VoiceSatelliteProtocol:
     sat.state.wakeup_sound = "wakeup.flac"
     sat.state.mqtt_client = None
     sat.state.mqtt_state_topic = None
+    # Stage B: satellite shim reads state.device_session. MagicMock would
+    # auto-spawn a child mock here, so make the cold-start path explicit.
+    sat.state.device_session = None
+    sat.state.ha_bridge = None
     sat.state.generation = 0
     sat.state.last_cancel_reason = None
     sat.state.last_cancel_ts = None
