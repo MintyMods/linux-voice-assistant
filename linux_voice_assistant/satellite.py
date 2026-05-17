@@ -779,7 +779,15 @@ class VoiceSatelliteProtocol(APIServer):
         )
 
     def _on_wakeup_sound_finished(self, wake_word_phrase: str, captured_gen: int = 0) -> None:
-        """Callback invoked when the wakeup sound finishes playing."""
+        """Callback invoked when the wakeup sound finishes playing.
+
+        Two paths:
+          v1 (Stage B3+): mic_capture is wired — DeviceSession owns the audio
+            path. We hand off to DS.on_wake_chime_finished which transitions
+            WAKING→LISTENING and calls mic_capture.start_capture(). We do NOT
+            send VoiceAssistantRequest(start=True) — HA's pipeline stays idle.
+          v0 (fallback): no mic_capture — keep the original HA-streaming path.
+        """
         if not self._gen_check(captured_gen):
             _LOGGER.debug("Wakeup sound finished but generation moved (captured=%d, current=%d); dropping", captured_gen, self._generation)
             return
@@ -789,7 +797,21 @@ class VoiceSatelliteProtocol(APIServer):
             # we would restart streaming immediately after the abort.
             _LOGGER.debug("Wakeup sound finished but pipeline aborted; not starting stream")
             return
-        _LOGGER.debug("Wakeup sound finished, starting audio streaming with wake word: %s", wake_word_phrase)
+
+        ds = getattr(self.state, "device_session", None)
+        mic = getattr(self.state, "mic_capture", None)
+        if ds is not None and mic is not None:
+            _LOGGER.debug("Wakeup sound finished (v1 path): handing off to DeviceSession for %s", wake_word_phrase)
+            if ds.on_wake_chime_finished(captured_gen):
+                # DS now owns LISTENING→THINKING→SPEAKING→IDLE transitions.
+                # Satellite stays out of HA streaming; cancel/stop semantics
+                # remain the same (stop() still aborts cleanly).
+                return
+            # DS dropped the wake (gen moved during chime). Fall through to
+            # the cleanup path — nothing further to do.
+            return
+
+        _LOGGER.debug("Wakeup sound finished (v0 path), starting audio streaming with wake word: %s", wake_word_phrase)
         self._set_state_label("LISTENING")
         self.send_messages(
             [VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)],
@@ -824,7 +846,38 @@ class VoiceSatelliteProtocol(APIServer):
         # them on EVERY stop() call regardless of internal flags — this is
         # what makes forced double-press cancel work even if the first press
         # cleared internal state.
+        prev_gen = self._generation
         self._bump_gen()
+
+        # v1 path cleanup (Stage B3): drop any in-flight mic capture so the
+        # next wake starts clean, and tell the bridge to cancel /chat in
+        # flight (L.2). Both are no-ops when components aren't wired.
+        mic = getattr(self.state, "mic_capture", None)
+        if mic is not None:
+            try:
+                mic.abort()
+            except Exception:
+                _LOGGER.exception("MicCapture.abort raised during stop()")
+
+        bridge = getattr(self.state, "bridge_client", None)
+        loop = getattr(self.state, "loop", None)
+        if bridge is not None and loop is not None:
+            def _schedule_cancel() -> None:
+                try:
+                    loop.create_task(
+                        bridge.cancel(
+                            device=self.state.room,
+                            generation=prev_gen,
+                            reason=cancel_reason or "RED_BUTTON_SOFT",
+                        )
+                    )
+                except Exception:
+                    _LOGGER.exception("Failed to schedule bridge cancel for gen=%d", prev_gen)
+            try:
+                loop.call_soon_threadsafe(_schedule_cancel)
+            except RuntimeError:
+                # Loop is shutting down; cancel will not be needed.
+                pass
 
         self.state.active_wake_words.discard(self.state.stop_word.id)
         self._pipeline_active = False

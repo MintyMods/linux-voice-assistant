@@ -144,6 +144,13 @@ class ServerState:
     session_id: Optional[str] = None
     device_state: str = "IDLE"
 
+    # Stage B3 — local audio capture path (replaces v0 HA STT streaming).
+    mic_capture: Any = None
+    tts_output: Any = None
+    # asyncio loop reference for thread-safe scheduling from sync threads
+    # (process_audio stop-word path, paho MQTT callbacks). Set once in main().
+    loop: Any = None
+
     def save_preferences(self) -> None:
         """Save preferences as JSON."""
         _LOGGER.debug("Saving preferences: %s", self.preferences_path)

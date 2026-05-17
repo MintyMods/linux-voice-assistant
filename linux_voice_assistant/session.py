@@ -14,6 +14,7 @@ v1-spec-O-lva-integration.md §O.2 and v1-progress.md Stage F).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -23,6 +24,7 @@ from typing import TYPE_CHECKING, Optional, Union
 
 if TYPE_CHECKING:
     from .ha_bridge import HABridge
+    from .mic_capture import SpeechBuffer
     from .models import ServerState
 
 _LOGGER = logging.getLogger(__name__)
@@ -171,3 +173,165 @@ class DeviceSession:
             )
         except Exception:
             _LOGGER.exception("HABridge.publish_state raised; swallowing to keep state machine alive")
+
+    # -- B3 lifecycle hooks (audio path) -----------------------------------
+
+    def on_wake_chime_finished(self, captured_gen: int) -> bool:
+        """v1 path: chime done, start local mic capture.
+
+        Returns True when the transition fired; False when gen has moved
+        (i.e. cancel happened during the chime) and the caller should not
+        proceed with the wake. Called from satellite._on_wakeup_sound_finished
+        when state.mic_capture is wired; replaces the v0 HA streaming start.
+        """
+        if not self.gen_check(captured_gen):
+            _LOGGER.debug("on_wake_chime_finished: gen moved (captured=%d, current=%d); dropping",
+                          captured_gen, self._generation)
+            return False
+        self.transition_to(State.LISTENING, reason="wake_chime_finished")
+        mic = getattr(self.state, "mic_capture", None)
+        if mic is not None:
+            try:
+                mic.start_capture()
+            except Exception:
+                _LOGGER.exception("MicCapture.start_capture raised; cancelling wake")
+                self._cancel_via_satellite("MIC_CAPTURE_FAILED")
+                return False
+        else:
+            _LOGGER.warning("on_wake_chime_finished: no mic_capture wired; v1 path stalled")
+        return True
+
+    def on_speech_captured(self, buf: "SpeechBuffer") -> None:
+        """Receives a captured speech buffer from MicCapture (loop callback).
+
+        Schedules the ASR → bridge → TTS coroutine; gen-checks at every await.
+        Safe to call when state has moved (will short-circuit at the first
+        gen-check).
+        """
+        if self._state == State.IDLE:
+            _LOGGER.debug("on_speech_captured but state is IDLE; dropping")
+            return
+        captured_gen = self._generation
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _LOGGER.warning("on_speech_captured called outside a running loop; dropping")
+            return
+        loop.create_task(self._run_turn(captured_gen, buf))
+
+    async def _run_turn(self, captured_gen: int, buf: "SpeechBuffer") -> None:
+        """ASR → bridge → TTS. Each await gen-checks; cancel = silent abort."""
+        if not self.gen_check(captured_gen):
+            return
+
+        asr = getattr(self.state, "asr_client", None)
+        bridge = getattr(self.state, "bridge_client", None)
+        tts = getattr(self.state, "tts_output", None)
+        if asr is None or bridge is None or tts is None:
+            _LOGGER.warning("_run_turn: missing component(s) asr=%s bridge=%s tts=%s; aborting",
+                            asr is not None, bridge is not None, tts is not None)
+            self._cancel_via_satellite("MISSING_COMPONENT")
+            return
+
+        self.transition_to(State.THINKING, reason="speech_captured")
+
+        # ---- ASR -----------------------------------------------------------
+        try:
+            asr_result = await asr.transcribe(buf.wav_bytes)
+        except Exception as exc:
+            _LOGGER.warning("ASR failed: %s", exc)
+            if self.gen_check(captured_gen):
+                self._cancel_via_satellite("ASR_FAILED")
+            return
+        if not self.gen_check(captured_gen):
+            _LOGGER.debug("_run_turn: gen moved after ASR; dropping reply path")
+            return
+
+        # ---- Bridge --------------------------------------------------------
+        try:
+            reply = await bridge.chat(
+                device=self.state.room,
+                generation=captured_gen,
+                session_id=self._session_id or "",
+                text=asr_result.text,
+                asr_confidence=asr_result.confidence,
+            )
+        except Exception as exc:
+            _LOGGER.warning("Bridge /chat failed: %s", exc)
+            if self.gen_check(captured_gen):
+                self._cancel_via_satellite("BRIDGE_TIMEOUT")
+            return
+        if not self.gen_check(captured_gen):
+            _LOGGER.debug("_run_turn: gen moved after bridge; dropping TTS")
+            return
+        if not reply.reply.strip():
+            _LOGGER.info("Bridge returned empty reply; returning to IDLE")
+            self.transition_to(State.IDLE, reason="empty_reply")
+            sat = getattr(self.state, "satellite", None)
+            if sat is not None:
+                try:
+                    sat.unduck()
+                except Exception:
+                    pass
+            return
+
+        # ---- TTS -----------------------------------------------------------
+        self.transition_to(State.SPEAKING, reason="bridge_reply")
+        sat = getattr(self.state, "satellite", None)
+        player = getattr(self.state, "tts_player", None)
+        if player is None:
+            _LOGGER.error("_run_turn: tts_player missing; cannot speak reply")
+            self._cancel_via_satellite("MISSING_COMPONENT")
+            return
+
+        speak_done = asyncio.Event()
+
+        def _on_speak_done() -> None:
+            speak_done.set()
+
+        try:
+            await tts.speak(player, text=reply.reply, done_callback=_on_speak_done)
+        except Exception as exc:
+            _LOGGER.warning("TTS speak failed: %s", exc)
+            if self.gen_check(captured_gen):
+                self._cancel_via_satellite("TTS_FAILED")
+            return
+
+        # Wait for mpv playback to complete; gen-check after.
+        try:
+            await speak_done.wait()
+        except asyncio.CancelledError:
+            return
+        if not self.gen_check(captured_gen):
+            _LOGGER.debug("_run_turn: gen moved during TTS playback; not transitioning")
+            return
+
+        # Continue-conversation handling (D-bridge follow-up marker, Roadmap §2).
+        if reply.continue_conversation:
+            self.transition_to(State.FOLLOWUP, reason="follow_up")
+            mic = getattr(self.state, "mic_capture", None)
+            if mic is not None:
+                mic.start_capture()
+            self.transition_to(State.LISTENING, reason="follow_up_listening")
+        else:
+            self.transition_to(State.IDLE, reason="reply_done")
+            # Mirror the satellite-level "unduck after TTS" UX so music returns.
+            if sat is not None:
+                try:
+                    sat.unduck()
+                except Exception:
+                    pass
+
+    def _cancel_via_satellite(self, reason: str) -> None:
+        """Trigger the same cancel chain a red-button press would, with a
+        component-specific reason. Bumps gen → satellite.stop() → IDLE +
+        K.1 publish + bridge cancel are handled there.
+        """
+        sat = getattr(self.state, "satellite", None)
+        if sat is None:
+            self.transition_to(State.IDLE, reason="cancel_no_sat", cancel_reason=reason)
+            return
+        try:
+            sat.stop(cancel_reason=reason)
+        except Exception:
+            _LOGGER.exception("satellite.stop raised during _cancel_via_satellite")

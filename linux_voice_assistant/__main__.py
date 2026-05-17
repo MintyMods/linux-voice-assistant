@@ -18,12 +18,15 @@ from getmac import get_mac_address  # type: ignore
 from pymicro_wakeword import MicroWakeWord, MicroWakeWordFeatures
 from pyopen_wakeword import OpenWakeWord, OpenWakeWordFeatures
 
+from .asr_client import ASRClient
 from .bridge_client import BridgeClient
 from .ha_bridge import HABridge
+from .mic_capture import MicCapture, SpeechBuffer
 from .models import Preferences, ServerState
 from .mpv_player import MpvMediaPlayer
 from .satellite import VoiceSatelliteProtocol
 from .session import DeviceSession
+from .tts_output import TTSOutput
 from .util import (
     get_default_interface,
     get_default_ipv4,
@@ -391,6 +394,10 @@ async def main() -> None:
     )
     process_audio_thread.start()
 
+    # Expose the loop on state BEFORE wiring subscribers — satellite.stop()
+    # reads state.loop to schedule bridge cancels thread-safely.
+    state.loop = loop
+
     # MQTT cancel side-channel — lets an external trigger (red Calisto button
     # via led_service.py, HA automation) abort the current voice pipeline
     # without restarting the process. The native ESPHome protocol has no
@@ -399,8 +406,8 @@ async def main() -> None:
 
     # Stage B — DeviceSession + HABridge + BridgeClient. The satellite still
     # drives the v0 HA pipeline in B2; DeviceSession is a parallel state
-    # holder + K.1 publisher. BridgeClient is constructed but not called from
-    # any code path in B2 (B3 wires the audio path through it).
+    # holder + K.1 publisher. B3 wires MicCapture/ASR/TTS so the satellite
+    # hands off the ASR path to DeviceSession.
     _start_stage_b_components(state, loop)
 
     # Auto discovery (zeroconf, mDNS)
@@ -603,23 +610,75 @@ def _start_stage_b_components(state: ServerState, loop: asyncio.AbstractEventLoo
     session.transition_to("STARTING", reason="startup")
     session.transition_to("IDLE", reason="startup")
 
-    # BridgeClient — built but not used by any code path in B2. Stage B3
-    # wires audio capture → ASR → BridgeClient.chat. Tests construct their
-    # own client; production simply has it ready.
+    # BridgeClient — wired in B3 as the THINKING-phase outbound HTTP.
     bridge_url = os.environ.get("BRIDGE_URL")
     if bridge_url:
         try:
             state.bridge_client = BridgeClient(bridge_url, device_session=session)
-            _LOGGER.info("BridgeClient initialised for %s (B2: idle; B3 wires audio path)", bridge_url)
+            _LOGGER.info("BridgeClient initialised for %s", bridge_url)
         except Exception:
             _LOGGER.exception("BridgeClient construction failed")
     else:
-        _LOGGER.info("BRIDGE_URL not set; BridgeClient disabled (Stage B3 dependency)")
+        _LOGGER.warning("BRIDGE_URL not set; v1 audio path disabled — wake will stall in WAKING")
+
+    # ---- Stage B3 audio path: MicCapture + ASRClient + TTSOutput ----------
+    whisper_uri = os.environ.get("WYOMING_WHISPER_URI")
+    piper_uri = os.environ.get("WYOMING_PIPER_URI")
+    asr_language = os.environ.get("ASR_LANGUAGE", "en")
+    piper_voice = os.environ.get("PIPER_VOICE") or None
+    hotwords_raw = os.environ.get("ASR_HOTWORDS", "")
+    hotwords = [w.strip() for w in hotwords_raw.split(",") if w.strip()]
+
+    if whisper_uri:
+        try:
+            state.asr_client = ASRClient(
+                whisper_uri,
+                language=asr_language,
+                hotwords=hotwords,
+            )
+            _LOGGER.info("ASRClient initialised (uri=%s lang=%s hotwords=%d)",
+                         whisper_uri, asr_language, len(hotwords))
+        except Exception:
+            _LOGGER.exception("ASRClient construction failed")
+    else:
+        _LOGGER.warning("WYOMING_WHISPER_URI not set; v1 audio path disabled (ASR off)")
+
+    if piper_uri:
+        try:
+            state.tts_output = TTSOutput(piper_uri, voice=piper_voice)
+            _LOGGER.info("TTSOutput initialised (uri=%s voice=%s)", piper_uri, piper_voice)
+        except Exception:
+            _LOGGER.exception("TTSOutput construction failed")
+    else:
+        _LOGGER.warning("WYOMING_PIPER_URI not set; v1 audio path disabled (TTS off)")
+
+    # MicCapture wires only when ASR + bridge are both up — otherwise the v0
+    # path is preferable to a half-broken v1 path. MicCapture refuses to
+    # construct without TEN-VAD (otherwise capture degrades silently to a
+    # 400ms cap); we log+leave the v0 path active in that case.
+    if state.asr_client is not None and state.bridge_client is not None and state.tts_output is not None:
+        try:
+            state.mic_capture = MicCapture(
+                loop=loop,
+                on_speech_captured=session.on_speech_captured,
+            )
+            _LOGGER.warning("MicCapture initialised — v1 audio path ACTIVE (lounge no longer streams to HA)")
+        except RuntimeError as exc:
+            _LOGGER.error("MicCapture refused to wire (%s); v1 audio path DISABLED, v0 HA-streaming retained", exc)
+        except Exception:
+            _LOGGER.exception("MicCapture construction failed; v1 audio path DISABLED")
+    else:
+        _LOGGER.warning(
+            "MicCapture disabled — asr=%s bridge=%s tts=%s; v0 HA-streaming path retained",
+            state.asr_client is not None,
+            state.bridge_client is not None,
+            state.tts_output is not None,
+        )
 
     # Stage F placeholders — surfaced into logs so deploy-time misconfigs
     # are visible before F lands the watchdog/heartbeat code.
     _LOGGER.info(
-        "Stage F env (read but unused in B2): STATE_REASSERT_INTERVAL_S=%s HEARTBEAT_INTERVAL_S=%s",
+        "Stage F env (read but unused in B3): STATE_REASSERT_INTERVAL_S=%s HEARTBEAT_INTERVAL_S=%s",
         os.environ.get("STATE_REASSERT_INTERVAL_S", "30"),
         os.environ.get("HEARTBEAT_INTERVAL_S", "60"),
     )
@@ -747,6 +806,15 @@ def process_audio(state: ServerState, mic, block_size: int):
 
                 try:
                     state.satellite.handle_audio(audio_chunk)
+
+                    # Stage B3 — feed the v1 mic-capture path. The ring buffer
+                    # always fills (for pre-roll); capture-active state is
+                    # internal to MicCapture. Safe no-op when not wired.
+                    if state.mic_capture is not None:
+                        try:
+                            state.mic_capture.feed(audio_chunk)
+                        except Exception:
+                            _LOGGER.exception("MicCapture.feed raised")
 
                     assert micro_features is not None
                     micro_inputs.clear()

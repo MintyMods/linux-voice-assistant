@@ -35,6 +35,8 @@ dependencies = [
     "webrtc_noise_gain",
     "paho-mqtt>=2,<3",
     "httpx>=0.27,<1",
+    "wyoming>=1.9,<2",
+    "ten-vad>=1.0.6,<2",
 ]
 dynamic = ["version"]
 
