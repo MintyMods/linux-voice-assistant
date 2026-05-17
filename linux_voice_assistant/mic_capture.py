@@ -53,10 +53,14 @@ PRE_ROLL_MS = 200
 # (e.g. "Alexa", "Calisto"). Tunable in Stage F via M.5.
 WAKE_TOKEN_STRIP_MS = 250
 
-# D4 — silence-end threshold.
+# D4 — silence-end threshold (only counted AFTER first speech detected).
 SILENCE_END_MS = 400
 # D5 — hard cap on capture duration.
 MAX_CAPTURE_MS = 30_000
+# Max wait between start_capture and first VAD-detected speech. Without
+# this, an empty wake (user wakes but says nothing) would run for 30 s.
+# Tuned to "if the user hasn't started talking within 2 s of the chime, abort".
+NO_SPEECH_TIMEOUT_MS = 2_000
 # D8 — leave ~200 ms of leading/trailing silence either side of speech.
 EDGE_KEEP_MS = 200
 
@@ -114,6 +118,7 @@ class MicCapture:
         vad_threshold: float = 0.5,
         silence_end_ms: int = SILENCE_END_MS,
         max_capture_ms: int = MAX_CAPTURE_MS,
+        no_speech_timeout_ms: int = NO_SPEECH_TIMEOUT_MS,
         pre_roll_ms: int = PRE_ROLL_MS,
         wake_token_strip_ms: int = WAKE_TOKEN_STRIP_MS,
         denoise: Optional[Callable[[bytes], bytes]] = None,
@@ -123,6 +128,7 @@ class MicCapture:
         self._cb = on_speech_captured
         self._silence_end_ms = silence_end_ms
         self._max_capture_ms = max_capture_ms
+        self._no_speech_timeout_ms = no_speech_timeout_ms
         self._pre_roll_ms = pre_roll_ms
         self._wake_token_strip_ms = wake_token_strip_ms
         self._denoise = denoise
@@ -142,6 +148,8 @@ class MicCapture:
         self._aborted = False
         self._capture_buf = bytearray()
         self._start_ts: float = 0.0
+        self._first_speech_ts: float = 0.0
+        self._speech_seen: bool = False
         self._silent_run_ms = 0.0
         self._vad_prob_sum = 0.0
         self._vad_prob_count = 0
@@ -197,21 +205,38 @@ class MicCapture:
                 return
 
             self._capture_buf.extend(chunk)
-            # Run TEN-VAD hop-by-hop and let each silent hop tick the silence
-            # run-time. A speech hop resets it. End-of-speech triggers on the
-            # first hop that crosses the threshold — we stop processing the
-            # rest of the chunk to avoid clipping into the next utterance.
+            # Run TEN-VAD hop-by-hop. Two phases:
+            #   1. PRE-SPEECH: silence_run_ms is NOT counted (user hasn't
+            #      started talking yet). If we hit `no_speech_timeout_ms`
+            #      since start_capture without ever seeing speech → abort
+            #      this capture with end_reason="no_speech".
+            #   2. POST-SPEECH (after first speech hop): each silent hop ticks
+            #      silence_run_ms; SILENCE_END_MS continuous silence ends it.
+            # End-of-speech triggers on the first hop that crosses the
+            # threshold — we stop processing further hops in this chunk to
+            # avoid clipping into the next utterance.
             hop_ms = (VAD_HOP / SAMPLE_RATE) * 1000.0
             for is_speech, prob in self._iter_vad_hops(chunk):
                 if prob > 0:
                     self._vad_prob_sum += prob
                     self._vad_prob_count += 1
                 if is_speech:
+                    if not self._speech_seen:
+                        self._speech_seen = True
+                        self._first_speech_ts = time.monotonic()
                     self._silent_run_ms = 0.0
-                else:
+                elif self._speech_seen:
                     self._silent_run_ms += hop_ms
-                if self._silent_run_ms >= self._silence_end_ms:
+                if self._speech_seen and self._silent_run_ms >= self._silence_end_ms:
                     self._finish_locked(end_reason="silence")
+                    return
+            # No-speech timeout: compute elapsed from captured bytes (so
+            # synthetic tests with one big silence chunk fire just like
+            # real-time mic chunks of a sleeping user).
+            if not self._speech_seen:
+                buffered_ms = (len(self._capture_buf) / SAMPLE_WIDTH / SAMPLE_RATE) * 1000.0
+                if buffered_ms >= self._no_speech_timeout_ms:
+                    self._finish_locked(end_reason="no_speech")
                     return
 
     def _iter_vad_hops(self, chunk: bytes):
@@ -258,6 +283,8 @@ class MicCapture:
             self._silent_run_ms = 0.0
             self._vad_prob_sum = 0.0
             self._vad_prob_count = 0
+            self._speech_seen = False
+            self._first_speech_ts = 0.0
             self._start_ts = time.monotonic()
 
             # D6 — emit the trailing 200 ms of the pre-roll ring AFTER

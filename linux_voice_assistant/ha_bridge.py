@@ -49,6 +49,10 @@ class HABridge:
         self.password = password
         self.client_id = client_id or f"lva-ha-bridge-{room}"
         self.state_topic = f"calisto/{room}/session/state"
+        # B3 stop-gap: also drive the legacy `calisto/<room>/led/set` control
+        # plane so the existing calisto-led service lights the red phone LED.
+        # Stage E absorbs LED control into LVA proper.
+        self.led_topic = f"calisto/{room}/led/set"
         # client_factory(client_id, clean_session) -> client.  When None,
         # start() imports paho.mqtt.client and uses its real Client class.
         # Tests inject a factory returning FakeMqttClient.
@@ -152,3 +156,25 @@ class HABridge:
             client.publish(self.state_topic, json.dumps(payload), qos=1, retain=True)
         except Exception:
             _LOGGER.exception("HABridge.publish_state failed for topic %s", self.state_topic)
+
+        # B3 stop-gap LED mirror — the v0 calisto-led service consumes:
+        #   wake|processing|complete|off|error  on calisto/<room>/led/set
+        # Stage E will absorb LED control into LVA proper (E1..E6).
+        led_cmd = _STATE_TO_LED.get(state_value)
+        if led_cmd is not None:
+            try:
+                client.publish(self.led_topic, led_cmd, qos=1, retain=False)
+            except Exception:
+                _LOGGER.exception("HABridge LED mirror failed for topic %s", self.led_topic)
+
+
+# Map K.1 states to legacy calisto-led `led/set` commands.  See
+# calisto-led/led_service.py:LedDriver.apply for the verbs.
+_STATE_TO_LED = {
+    State.WAKING.value: "wake",
+    State.LISTENING.value: "wake",
+    State.THINKING.value: "processing",
+    State.SPEAKING.value: "complete",
+    State.FOLLOWUP.value: "wake",
+    State.IDLE.value: "off",
+}

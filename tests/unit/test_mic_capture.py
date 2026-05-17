@@ -152,8 +152,9 @@ def test_wake_token_strip_drops_recent_audio_from_preroll():
         mc.feed(_speech(500, amplitude=8000))
         # Recent (wake-token range) silence — this should be the part stripped.
         mc.feed(_silence(WAKE_TOKEN_STRIP_MS))
-        # Start, then a tiny utterance + silence to end.
+        # Start; speech (to arm silence timer), then silence to end.
         mc.start_capture()
+        mc.feed(_speech(100))
         mc.feed(_silence(SILENCE_END_MS + 50))
         loop.run_until_complete(asyncio.sleep(0))
         loop.run_until_complete(asyncio.sleep(0))
@@ -163,6 +164,23 @@ def test_wake_token_strip_drops_recent_audio_from_preroll():
         pcm = _wav_to_pcm(emitted[0].wav_bytes)
         samples = np.frombuffer(pcm, dtype=np.int16)
         assert int(np.max(np.abs(samples))) > 4000
+    finally:
+        loop.close()
+
+
+def test_no_speech_timeout_fires_with_no_speech_reason():
+    """Empty wake: capture ends with end_reason=no_speech after the timeout."""
+    loop = asyncio.new_event_loop()
+    try:
+        emitted: List[SpeechBuffer] = []
+        mc = MicCapture(loop=loop, on_speech_captured=lambda b: emitted.append(b),
+                        no_speech_timeout_ms=500)
+        mc.start_capture()
+        mc.feed(_silence(600))  # past the no-speech timeout
+        loop.run_until_complete(asyncio.sleep(0))
+        loop.run_until_complete(asyncio.sleep(0))
+        assert len(emitted) == 1
+        assert emitted[0].end_reason == "no_speech"
     finally:
         loop.close()
 

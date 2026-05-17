@@ -22,8 +22,15 @@ def _make_state():
 
 
 def _last_publish(client) -> dict:
-    assert client.publishes, "expected at least one publish"
-    return json.loads(client.publishes[-1][1])
+    """Return the most recent K.1 state-topic publish as a dict.
+
+    B3 added a stop-gap LED mirror publish to `calisto/<room>/led/set` (plain
+    string), so the last entry in client.publishes is NOT always the K.1
+    JSON we care about. Filter to the state topic before parsing.
+    """
+    state_topics = [p for p in client.publishes if p[0].endswith("/session/state")]
+    assert state_topics, "expected at least one /session/state publish"
+    return json.loads(state_topics[-1][1])
 
 
 # ---- HABridge LWT + publish ------------------------------------------------
@@ -76,8 +83,9 @@ def test_habridge_publish_state_emits_k1_payload(fake_paho):
     assert payload["cancel_reason"] is None
     assert payload["since_ms"] == 0
     assert "ts" in payload
-    # Must be published retained QoS1 per K.1.
-    topic, _, qos, retain = client.publishes[-1]
+    # Must be published retained QoS1 per K.1. Filter past the B3 LED mirror.
+    state_pubs = [p for p in client.publishes if p[0].endswith("/session/state")]
+    topic, _, qos, retain = state_pubs[-1]
     assert topic == "calisto/lounge/session/state"
     assert qos == 1
     assert retain is True
@@ -104,11 +112,12 @@ def test_device_session_transitions_publish_to_habridge(fake_paho):
     ds.transition_to(State.SPEAKING)
     ds.transition_to(State.IDLE)
 
-    new_publishes = client.publishes[pre_count:]
+    # Filter past the B3 LED mirror publishes on calisto/<room>/led/set.
+    new_publishes = [p for p in client.publishes[pre_count:] if p[0].endswith("/session/state")]
     assert [json.loads(p[1])["state"] for p in new_publishes] == [
         "WAKING", "LISTENING", "THINKING", "SPEAKING", "IDLE",
     ]
-    # ALL transition publishes are retained QoS1.
+    # ALL state-topic publishes are retained QoS1.
     for _, _, qos, retain in new_publishes:
         assert qos == 1
         assert retain is True
@@ -254,8 +263,9 @@ def test_satellite_shim_routes_through_device_session(fake_paho):
     wake_word.wake_word = "okay_nabu"
     sat.wakeup(wake_word)
 
-    # WAKING publish landed.
-    transitions = [json.loads(p[1])["state"] for p in client.publishes[pre_count:]]
+    # WAKING publish landed (filter past the B3 LED mirror publishes).
+    new_pubs = [p for p in client.publishes[pre_count:] if p[0].endswith("/session/state")]
+    transitions = [json.loads(p[1])["state"] for p in new_pubs]
     assert "WAKING" in transitions
     # session_id minted via DS and mirrored to satellite.
     assert ds.session_id is not None
@@ -267,7 +277,7 @@ def test_satellite_shim_routes_through_device_session(fake_paho):
     pre_cancel = len(client.publishes)
     sat.stop(cancel_reason="RED_BUTTON_SOFT")
 
-    cancel_publishes = client.publishes[pre_cancel:]
+    cancel_publishes = [p for p in client.publishes[pre_cancel:] if p[0].endswith("/session/state")]
     # Exactly one publish for the cancel transition (no double-publish).
     idle_payloads = [json.loads(p[1]) for p in cancel_publishes if json.loads(p[1])["state"] == "IDLE"]
     assert len(idle_payloads) == 1, f"expected exactly one IDLE publish, got {idle_payloads}"

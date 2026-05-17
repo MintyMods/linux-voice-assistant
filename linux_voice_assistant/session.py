@@ -224,6 +224,20 @@ class DeviceSession:
         if not self.gen_check(captured_gen):
             return
 
+        # An empty wake (user said nothing within the no-speech timeout)
+        # short-circuits: no ASR call, just unduck and return to IDLE so the
+        # next wake works. Mirrors how Alexa handles a "where'd you go" wake.
+        if getattr(buf, "end_reason", "") == "no_speech":
+            _LOGGER.info("Wake captured no speech; returning to IDLE without ASR call")
+            self.transition_to(State.IDLE, reason="no_speech")
+            sat = getattr(self.state, "satellite", None)
+            if sat is not None:
+                try:
+                    sat.unduck()
+                except Exception:
+                    pass
+            return
+
         asr = getattr(self.state, "asr_client", None)
         bridge = getattr(self.state, "bridge_client", None)
         tts = getattr(self.state, "tts_output", None)
