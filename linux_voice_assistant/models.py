@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from queue import Queue
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 
 if TYPE_CHECKING:
     from pymicro_wakeword import MicroWakeWord
@@ -126,6 +126,14 @@ class ServerState:
     mic_noise_suppression: int = 0
     mic_volume: int = 100  # 1–100, default maximum
     timer_max_ring_seconds: float = 900.0
+
+    # Stage A — generation visibility for tests + logs, K.1 publish hooks.
+    generation: int = 0
+    last_cancel_reason: Optional[str] = None
+    last_cancel_ts: Optional[float] = None
+    room: str = "lounge"
+    mqtt_client: Any = None
+    mqtt_state_topic: Optional[str] = None
 
     def save_preferences(self) -> None:
         """Save preferences as JSON."""

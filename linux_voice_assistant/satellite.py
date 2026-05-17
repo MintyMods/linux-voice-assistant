@@ -2,12 +2,15 @@
 
 import asyncio
 import hashlib
+import json
 import logging
 import posixpath
 import shutil
 import threading
 import time
+import uuid
 from collections.abc import Iterable
+from datetime import datetime
 from typing import Dict, List, Optional, Set, Union
 from urllib.parse import urlparse, urlunparse
 from urllib.request import urlopen
@@ -325,6 +328,57 @@ class VoiceSatelliteProtocol(APIServer):
         self._external_wake_words: Dict[str, VoiceAssistantExternalWakeWord] = {}
         self._disconnect_event = asyncio.Event()
 
+        # Stage A — late-callback guard. _generation is bumped on every cancel
+        # (stop()) so any callback that captured the prior value can detect
+        # it's been pre-empted and silently drop. Pipeline-entry sites also
+        # capture into _pipeline_start_gen so INTENT_END / TTS_END handlers
+        # can short-circuit after an external abort.
+        self._generation: int = 0
+        self._gen_lock = threading.Lock()
+        self._pipeline_start_gen: int = 0
+        self._session_id: Optional[str] = None
+        self._state_label: str = "IDLE"
+        self._last_state_change_ts: float = time.monotonic()
+
+    # ------------------------------------------------------------------
+    # Stage A — generation counter + K.1 session/state publish
+    # ------------------------------------------------------------------
+
+    def _bump_gen(self) -> int:
+        with self._gen_lock:
+            self._generation += 1
+            self._last_state_change_ts = time.monotonic()
+            self.state.generation = self._generation
+            return self._generation
+
+    def _gen_check(self, captured: int) -> bool:
+        return captured == self._generation
+
+    def _set_state_label(self, new_state: str) -> None:
+        if new_state != self._state_label:
+            self._state_label = new_state
+            self._last_state_change_ts = time.monotonic()
+
+    def _publish_session_state(self, *, reason: str, cancel_reason: Optional[str]) -> None:
+        """Publish K.1 calisto/<room>/session/state. Fire-and-forget."""
+        mqtt_client = getattr(self.state, "mqtt_client", None)
+        topic = getattr(self.state, "mqtt_state_topic", None)
+        if mqtt_client is None or not topic:
+            return
+        payload = {
+            "state": self._state_label,
+            "generation": self._generation,
+            "session_id": self._session_id,
+            "ts": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            "reason": reason,
+            "cancel_reason": cancel_reason,
+            "since_ms": 0,
+        }
+        try:
+            mqtt_client.publish(topic, json.dumps(payload), qos=1, retain=True)
+        except Exception:
+            _LOGGER.exception("Failed to publish session/state to %s", topic)
+
     def _set_thinking_sound_enabled(self, new_state: bool) -> None:
         self.state.thinking_sound_enabled = bool(new_state)
         self.state.preferences.thinking_sound = 1 if self.state.thinking_sound_enabled else 0
@@ -389,6 +443,9 @@ class VoiceSatelliteProtocol(APIServer):
             self._tts_played = False
             self._continue_conversation = False
             self._pipeline_active = True
+            # Capture the generation that owns this HA pipeline run; INTENT_END
+            # and TTS_END check it to drop events that arrive after a cancel.
+            self._pipeline_start_gen = self._generation
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_INTENT_START and self.state.thinking_sound_enabled:
             # Play short "thinking/processing" sound if configured
             processing = getattr(self.state, "processing_sound", None)
@@ -408,9 +465,15 @@ class VoiceSatelliteProtocol(APIServer):
                 # Start streaming early
                 self.play_tts()
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_INTENT_END:
+            if not self._gen_check(self._pipeline_start_gen):
+                _LOGGER.debug("Dropping stale INTENT_END (gen=%d, current=%d)", self._pipeline_start_gen, self._generation)
+                return
             if data.get("continue_conversation") == "1":
                 self._continue_conversation = True
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_TTS_END:
+            if not self._gen_check(self._pipeline_start_gen):
+                _LOGGER.debug("Dropping stale TTS_END (gen=%d, current=%d)", self._pipeline_start_gen, self._generation)
+                return
             self._tts_url = data.get("url")
             self.play_tts()
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_RUN_END:
@@ -438,7 +501,7 @@ class VoiceSatelliteProtocol(APIServer):
                 self._timer_finished = True
                 self._timer_ring_start = time.monotonic()
                 self.duck()
-                self._play_timer_finished()
+                self._play_timer_finished(self._generation)
 
     def handle_message(self, msg: message.Message) -> Iterable[message.Message]:
         if isinstance(msg, VoiceAssistantEventResponse):
@@ -464,7 +527,9 @@ class VoiceSatelliteProtocol(APIServer):
             self._continue_conversation = msg.start_conversation
 
             self.duck()
-            self.state.tts_player.play(urls, done_callback=self._tts_finished)
+            self._set_state_label("SPEAKING")
+            captured_gen = self._generation
+            self.state.tts_player.play(urls, done_callback=lambda: self._tts_finished(captured_gen))
         elif isinstance(msg, VoiceAssistantTimerEventResponse):
             self.handle_timer_event(VoiceAssistantTimerEventType(msg.event_type), msg)
         elif isinstance(msg, DeviceInfoRequest):
@@ -633,10 +698,14 @@ class VoiceSatelliteProtocol(APIServer):
                     return
                 _LOGGER.debug("Delayed wakeup: playing wakeup sound for %s", wake_word_phrase)
                 self._pipeline_active = True
+                self._session_id = str(uuid.uuid4())
+                self._set_state_label("WAKING")
                 self.duck()
+                # Capture LAST so any concurrent stop() lands its _bump_gen before we read.
+                captured_gen = self._generation
                 self.state.tts_player.play(
                     self.state.wakeup_sound,
-                    done_callback=lambda: self._on_wakeup_sound_finished(wake_word_phrase),
+                    done_callback=lambda: self._on_wakeup_sound_finished(wake_word_phrase, captured_gen),
                 )
 
             threading.Timer(0.1, _delayed_wakeup).start()
@@ -653,14 +722,21 @@ class VoiceSatelliteProtocol(APIServer):
         wake_word_phrase = wake_word.wake_word  # type: ignore
         _LOGGER.debug("Detected wake word: %s", wake_word_phrase)
         self._pipeline_active = True
+        self._session_id = str(uuid.uuid4())
+        self._set_state_label("WAKING")
         self.duck()
+        # Capture LAST so any concurrent stop() lands its _bump_gen before we read.
+        captured_gen = self._generation
         self.state.tts_player.play(
             self.state.wakeup_sound,
-            done_callback=lambda: self._on_wakeup_sound_finished(wake_word_phrase),
+            done_callback=lambda: self._on_wakeup_sound_finished(wake_word_phrase, captured_gen),
         )
 
-    def _on_wakeup_sound_finished(self, wake_word_phrase: str) -> None:
+    def _on_wakeup_sound_finished(self, wake_word_phrase: str, captured_gen: int = 0) -> None:
         """Callback invoked when the wakeup sound finishes playing."""
+        if not self._gen_check(captured_gen):
+            _LOGGER.debug("Wakeup sound finished but generation moved (captured=%d, current=%d); dropping", captured_gen, self._generation)
+            return
         if not self._pipeline_active:
             # An external abort fired between wake-detect and chime-finish.
             # tts_player.stop() invokes this done_callback; without the guard
@@ -668,18 +744,23 @@ class VoiceSatelliteProtocol(APIServer):
             _LOGGER.debug("Wakeup sound finished but pipeline aborted; not starting stream")
             return
         _LOGGER.debug("Wakeup sound finished, starting audio streaming with wake word: %s", wake_word_phrase)
+        self._set_state_label("LISTENING")
         self.send_messages(
             [VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)],
         )
         self._is_streaming_audio = True
 
-    def stop(self) -> None:
+    def stop(self, cancel_reason: Optional[str] = None) -> None:
         # Full pipeline abort. Original implementation only stopped TTS
         # playback, which works ONLY if we're already in the TTS phase.
         # Pressing the panic button during wake-chime / listen / think
         # phases left _is_streaming_audio=True so we kept sending mic audio
         # to HA, the pipeline ran to completion, and TTS played anyway.
-        # Now: kill streaming, drop any pending TTS, unduck unconditionally.
+        # Now: bump generation FIRST (invalidates every captured gen so any
+        # in-flight callback drops), then kill streaming, drop pending TTS,
+        # unduck, and publish K.1 session/state with cancel_reason.
+        self._bump_gen()
+
         was_streaming = self._is_streaming_audio
         self.state.active_wake_words.discard(self.state.stop_word.id)
         self._pipeline_active = False
@@ -704,10 +785,22 @@ class VoiceSatelliteProtocol(APIServer):
 
         self.unduck()
         self.state.tts_player.stop()
-        _LOGGER.debug("Pipeline aborted: streaming stopped, TTS dropped, unducked")
+
+        # Move to IDLE, drop session id, publish K.1.
+        self._set_state_label("IDLE")
+        self._session_id = None
+        self.state.last_cancel_reason = cancel_reason
+        self.state.last_cancel_ts = time.time()
+        self._publish_session_state(reason="cancel_force", cancel_reason=cancel_reason)
+
+        _LOGGER.debug("Pipeline aborted: streaming stopped, TTS dropped, unducked (reason=%s)", cancel_reason)
 
     def play_tts(self) -> None:
         if (not self._tts_url) or self._tts_played:
+            return
+        if not self._gen_check(self._pipeline_start_gen):
+            _LOGGER.debug("Suppressing TTS playback: generation moved (gen=%d, current=%d)", self._pipeline_start_gen, self._generation)
+            self._tts_url = None
             return
         if not self._pipeline_active:
             # Pipeline was aborted between intent-end and TTS-arrival.
@@ -719,8 +812,10 @@ class VoiceSatelliteProtocol(APIServer):
         self._tts_played = True
         _LOGGER.debug("Playing TTS response: %s", self._tts_url)
 
+        self._set_state_label("SPEAKING")
+        captured_gen = self._generation
         self.state.active_wake_words.add(self.state.stop_word.id)
-        self.state.tts_player.play(self._tts_url, done_callback=self._tts_finished)
+        self.state.tts_player.play(self._tts_url, done_callback=lambda: self._tts_finished(captured_gen))
 
     def duck(self) -> None:
         _LOGGER.debug("Ducking music")
@@ -730,22 +825,31 @@ class VoiceSatelliteProtocol(APIServer):
         _LOGGER.debug("Unducking music")
         self.state.music_player.unduck()
 
-    def _tts_finished(self) -> None:
+    def _tts_finished(self, captured_gen: int = 0) -> None:
+        if not self._gen_check(captured_gen):
+            _LOGGER.debug("TTS-finished callback dropped: generation moved (captured=%d, current=%d)", captured_gen, self._generation)
+            return
         self._pipeline_active = False
         self.state.active_wake_words.discard(self.state.stop_word.id)
         self.send_messages([VoiceAssistantAnnounceFinished()])
 
         if self._continue_conversation:
+            self._set_state_label("FOLLOWUP")
             self.send_messages([VoiceAssistantRequest(start=True)])
             self._is_streaming_audio = True
             self._pipeline_active = True
             _LOGGER.debug("Continuing conversation")
         else:
+            self._set_state_label("IDLE")
+            self._session_id = None
             self.unduck()
 
         _LOGGER.debug("TTS response finished")
 
-    def _play_timer_finished(self) -> None:
+    def _play_timer_finished(self, captured_gen: int = 0) -> None:
+        if not self._gen_check(captured_gen):
+            _LOGGER.debug("Timer-finished callback dropped: generation moved (captured=%d, current=%d)", captured_gen, self._generation)
+            return
         if not self._timer_finished:
             _LOGGER.debug("Timer finished sound stopped")
             self.unduck()
@@ -771,7 +875,7 @@ class VoiceSatelliteProtocol(APIServer):
             self.state.timer_finished_sound,
             done_callback=lambda: call_all(
                 lambda: time.sleep(1.0),
-                self._play_timer_finished,
+                lambda: self._play_timer_finished(captured_gen),
             ),
         )
 

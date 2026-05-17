@@ -414,17 +414,51 @@ async def main() -> None:
 # -----------------------------------------------------------------------------
 
 
+# K.3 canonical reason codes. Unknown values fall back to EXTERNAL.
+_K3_REASONS = {
+    "RED_BUTTON_SOFT",
+    "RED_BUTTON_HARD",
+    "VOICE_STOP_WORD",
+    "STOP_EVERYTHING",
+    "STOP_WORD_INPROCESS",
+    "SILENCE_TIMEOUT",
+    "BRIDGE_TIMEOUT",
+    "DASHBOARD",
+    "EXTERNAL",
+}
+
+
+def _parse_cancel_reason(payload: bytes) -> str:
+    """Map K.3 cancel payload → reason code. v0 publishers send '1'; tolerate them."""
+    if not payload:
+        return "EXTERNAL"
+    try:
+        obj = json.loads(payload.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return "EXTERNAL"
+    if not isinstance(obj, dict):
+        return "EXTERNAL"
+    reason = obj.get("reason")
+    if isinstance(reason, str) and reason in _K3_REASONS:
+        return reason
+    return "EXTERNAL"
+
+
 def _start_mqtt_cancel_subscriber(state: ServerState, loop: asyncio.AbstractEventLoop) -> None:
     import os
     host = os.environ.get("LVA_MQTT_HOST")
     if not host:
         _LOGGER.info("LVA_MQTT_HOST not set; voice-cancel MQTT subscriber disabled")
         return
-    room = os.environ.get("LVA_ROOM", "lounge")
+    room = os.environ.get("ROOM", "lounge")
     port = int(os.environ.get("LVA_MQTT_PORT", "1883"))
     username = os.environ.get("LVA_MQTT_USER") or None
     password = os.environ.get("LVA_MQTT_PASS") or None
-    topic = f"calisto/{room}/voice/cancel"
+    # K.3 + K.4: scoped + broadcast cancel topics.
+    cancel_topic = f"calisto/{room}/cancel"
+    cancel_topic_all = "calisto/all/cancel"
+    # K.1: where satellite.stop() will publish session/state.
+    state_topic = f"calisto/{room}/session/state"
 
     try:
         import paho.mqtt.client as mqtt  # type: ignore
@@ -434,14 +468,14 @@ def _start_mqtt_cancel_subscriber(state: ServerState, loop: asyncio.AbstractEven
 
     cancel_beep = str(_SOUNDS_DIR / "mute_switch_on.flac")
 
-    def _cancel_pipeline() -> None:
+    def _cancel_pipeline(reason: str) -> None:
         sat = state.satellite
         if sat is None:
-            _LOGGER.debug("voice/cancel received but no satellite connected; nothing to abort")
+            _LOGGER.debug("cancel received (reason=%s) but no satellite connected; nothing to abort", reason)
             return
         try:
-            sat.stop()
-            _LOGGER.info("voice pipeline aborted via MQTT cancel")
+            sat.stop(cancel_reason=reason)
+            _LOGGER.info("voice pipeline aborted via MQTT cancel (reason=%s)", reason)
         except Exception:
             _LOGGER.exception("satellite.stop() raised during MQTT cancel")
         # Audible feedback that the cancel was received, regardless of what
@@ -454,14 +488,22 @@ def _start_mqtt_cancel_subscriber(state: ServerState, loop: asyncio.AbstractEven
 
     def _on_connect(c, _ud, _flags, rc, _props=None):
         if rc == 0:
-            c.subscribe(topic, qos=1)
-            _LOGGER.info("MQTT cancel subscriber connected to %s:%d, subscribed to %s", host, port, topic)
+            c.subscribe(cancel_topic, qos=1)
+            c.subscribe(cancel_topic_all, qos=1)
+            _LOGGER.info(
+                "MQTT cancel subscriber connected to %s:%d, subscribed to %s, %s",
+                host,
+                port,
+                cancel_topic,
+                cancel_topic_all,
+            )
         else:
             _LOGGER.error("MQTT cancel subscriber connect failed rc=%s", rc)
 
     def _on_message(_c, _ud, msg):
         _LOGGER.debug("MQTT cancel msg topic=%s payload=%r", msg.topic, msg.payload)
-        loop.call_soon_threadsafe(_cancel_pipeline)
+        reason = _parse_cancel_reason(msg.payload)
+        loop.call_soon_threadsafe(_cancel_pipeline, reason)
 
     client = mqtt.Client(
         mqtt.CallbackAPIVersion.VERSION2,  # type: ignore[attr-defined]
@@ -476,6 +518,10 @@ def _start_mqtt_cancel_subscriber(state: ServerState, loop: asyncio.AbstractEven
     try:
         client.connect_async(host, port, keepalive=60)
         client.loop_start()
+        # Expose the client + topic so satellite.stop() can publish K.1.
+        state.room = room
+        state.mqtt_client = client
+        state.mqtt_state_topic = state_topic
     except Exception:
         _LOGGER.exception("MQTT cancel subscriber failed to start")
 
@@ -667,7 +713,7 @@ def process_audio(state: ServerState, mic, block_size: int):
 
                     if stopped and (state.stop_word.id in state.active_wake_words) and not state.muted:
                         _LOGGER.debug("Stop word detected")
-                        state.satellite.stop()
+                        state.satellite.stop(cancel_reason="STOP_WORD_INPROCESS")
                 except Exception:
                     _LOGGER.exception("Unexpected error handling audio")
     except Exception:
