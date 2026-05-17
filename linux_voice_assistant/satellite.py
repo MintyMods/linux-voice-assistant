@@ -339,6 +339,13 @@ class VoiceSatelliteProtocol(APIServer):
         self._session_id: Optional[str] = None
         self._state_label: str = "IDLE"
         self._last_state_change_ts: float = time.monotonic()
+        # True while HA's pipeline_run is in flight on its side (we sent it
+        # VoiceAssistantRequest(start=True) and haven't yet sent the
+        # VoiceAssistantAnnounceFinished that releases it). stop() must send
+        # AnnounceFinished when this is True, otherwise HA's assist_satellite
+        # stays in 'responding'/'thinking' and the Calisto LED never returns
+        # to idle. Cleared on AnnounceFinished + every stop().
+        self._ha_pipeline_started: bool = False
 
     # ------------------------------------------------------------------
     # Stage A — generation counter + K.1 session/state publish
@@ -528,6 +535,9 @@ class VoiceSatelliteProtocol(APIServer):
 
             self.duck()
             self._set_state_label("SPEAKING")
+            # HA is in 'responding' for the duration of this announce — a
+            # cancel mid-announce must release that state.
+            self._ha_pipeline_started = True
             captured_gen = self._generation
             self.state.tts_player.play(urls, done_callback=lambda: self._tts_finished(captured_gen))
         elif isinstance(msg, VoiceAssistantTimerEventResponse):
@@ -749,22 +759,41 @@ class VoiceSatelliteProtocol(APIServer):
             [VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)],
         )
         self._is_streaming_audio = True
+        self._ha_pipeline_started = True
 
     def stop(self, cancel_reason: Optional[str] = None) -> None:
-        # Full pipeline abort. Original implementation only stopped TTS
-        # playback, which works ONLY if we're already in the TTS phase.
-        # Pressing the panic button during wake-chime / listen / think
-        # phases left _is_streaming_audio=True so we kept sending mic audio
-        # to HA, the pipeline ran to completion, and TTS played anyway.
-        # Now: bump generation FIRST (invalidates every captured gen so any
-        # in-flight callback drops), then kill streaming, drop pending TTS,
-        # unduck, and publish K.1 session/state with cancel_reason.
+        # Full pipeline abort. Bump generation FIRST so every captured gen
+        # in flight is invalidated and stale callbacks drop. Then unconditionally
+        # emit the two-message HA release sequence (so single-press and forced
+        # double-press both produce a deterministic abort regardless of phase),
+        # tear down local audio/TTS state, and publish K.1.
+        #
+        # Two-message HA release sequence — ORDER MATTERS:
+        #
+        # 1. VoiceAssistantRequest(start=False) — aioesphomeapi routes this to
+        #    handle_stop(abort=True) → ESPHome AssistSatellite _abort_pipeline()
+        #    → self._pipeline_task.cancel(). This is the ONLY wire mechanism
+        #    that stops an in-flight LLM/TTS turn. (Audio(end=True) is the SOFT
+        #    path — handle_stop(False) → _stop_pipeline() — which lets HA's
+        #    pipeline run to completion. We do not want that on cancel.)
+        #
+        # 2. VoiceAssistantAnnounceFinished — routes to handle_announcement_finished
+        #    → tts_response_finished() → _set_state(IDLE) on the assist_satellite
+        #    entity. Required because once TTS_START fires (_run_has_tts=True)
+        #    RUN_END alone does NOT transition state back to IDLE — only
+        #    tts_response_finished does. Cancelling the pipeline_task in step 1
+        #    suppresses any further TTS_START so this IDLE transition sticks.
+        #
+        # Both are safe no-ops when HA has no active pipeline_run, so we send
+        # them on EVERY stop() call regardless of internal flags — this is
+        # what makes forced double-press cancel work even if the first press
+        # cleared internal state.
         self._bump_gen()
 
-        was_streaming = self._is_streaming_audio
         self.state.active_wake_words.discard(self.state.stop_word.id)
         self._pipeline_active = False
         self._is_streaming_audio = False
+        self._ha_pipeline_started = False
         self._tts_url = None
         self._tts_played = False
         self._continue_conversation = False
@@ -773,27 +802,25 @@ class VoiceSatelliteProtocol(APIServer):
             self._timer_finished = False
             self._timer_ring_start = None
 
-        # Tell HA the audio stream is over so its pipeline_run exits cleanly
-        # rather than waiting for VAD timeout (which would leave the
-        # assist_satellite state stuck on "listening" — visible as the
-        # Calisto LEDs continuing to indicate listening).
-        if was_streaming:
-            try:
-                self.send_messages([VoiceAssistantAudio(data=b"", end=True)])
-            except Exception:
-                _LOGGER.exception("Failed to send stream-end on abort")
+        try:
+            self.send_messages([VoiceAssistantRequest(start=False)])
+        except Exception:
+            _LOGGER.exception("Failed to send VoiceAssistantRequest(start=False) on cancel")
+        try:
+            self.send_messages([VoiceAssistantAnnounceFinished()])
+        except Exception:
+            _LOGGER.exception("Failed to send VoiceAssistantAnnounceFinished on cancel")
 
         self.unduck()
         self.state.tts_player.stop()
 
-        # Move to IDLE, drop session id, publish K.1.
         self._set_state_label("IDLE")
         self._session_id = None
         self.state.last_cancel_reason = cancel_reason
         self.state.last_cancel_ts = time.time()
         self._publish_session_state(reason="cancel_force", cancel_reason=cancel_reason)
 
-        _LOGGER.debug("Pipeline aborted: streaming stopped, TTS dropped, unducked (reason=%s)", cancel_reason)
+        _LOGGER.debug("Pipeline aborted: HA release sequence sent, TTS dropped, unducked (reason=%s)", cancel_reason)
 
     def play_tts(self) -> None:
         if (not self._tts_url) or self._tts_played:
@@ -832,12 +859,16 @@ class VoiceSatelliteProtocol(APIServer):
         self._pipeline_active = False
         self.state.active_wake_words.discard(self.state.stop_word.id)
         self.send_messages([VoiceAssistantAnnounceFinished()])
+        # AnnounceFinished releases HA's responding state. If FOLLOWUP fires
+        # another start=True below, we'll flip this back to True.
+        self._ha_pipeline_started = False
 
         if self._continue_conversation:
             self._set_state_label("FOLLOWUP")
             self.send_messages([VoiceAssistantRequest(start=True)])
             self._is_streaming_audio = True
             self._pipeline_active = True
+            self._ha_pipeline_started = True
             _LOGGER.debug("Continuing conversation")
         else:
             self._set_state_label("IDLE")

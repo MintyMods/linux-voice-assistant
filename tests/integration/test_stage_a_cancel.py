@@ -13,7 +13,11 @@ import threading
 import time
 from unittest.mock import MagicMock
 
-from aioesphomeapi.api_pb2 import VoiceAssistantRequest  # type: ignore
+from aioesphomeapi.api_pb2 import (  # type: ignore
+    VoiceAssistantAnnounceFinished,
+    VoiceAssistantAudio,
+    VoiceAssistantRequest,
+)
 
 from linux_voice_assistant.satellite import VoiceSatelliteProtocol
 
@@ -47,10 +51,25 @@ def _make_bare_satellite() -> VoiceSatelliteProtocol:
     sat._timer_ring_start = None
     sat._processing = False
     sat._pipeline_active = False
+    sat._ha_pipeline_started = False
     sat._external_wake_words = {}
     sat._disconnect_event = MagicMock()
     sat.send_messages = MagicMock()
     return sat
+
+
+def _sent_messages(send_messages_mock):
+    """Flatten all messages passed across all send_messages() calls."""
+    out = []
+    for call in send_messages_mock.call_args_list:
+        msgs = call.args[0] if call.args else []
+        for m in msgs:
+            out.append(m)
+    return out
+
+
+def _has_message_of(send_messages_mock, msg_type) -> bool:
+    return any(isinstance(m, msg_type) for m in _sent_messages(send_messages_mock))
 
 
 def _capture_done_callbacks(tts_player_mock):
@@ -80,6 +99,17 @@ def _started_streams(send_messages_mock):
 # ----------------------------------------------------------------------------
 
 
+def _release_messages(send_messages_mock):
+    """Return all VoiceAssistantRequest(start=False) submissions seen."""
+    out = []
+    for call in send_messages_mock.call_args_list:
+        msgs = call.args[0] if call.args else []
+        for m in msgs:
+            if isinstance(m, VoiceAssistantRequest) and not getattr(m, "start", False):
+                out.append(m)
+    return out
+
+
 def test_false_wake_then_red_button_silent_abort():
     """Wake fires → chime starts → red button at +200ms → chime done_callback
     fires AFTER the cancel and must NOT submit a streaming-start request."""
@@ -89,7 +119,6 @@ def test_false_wake_then_red_button_silent_abort():
     wake_word = MagicMock()
     wake_word.wake_word = "okay_nabu"
 
-    # Wake fires (the audio thread invokes this).
     sat.wakeup(wake_word)
 
     assert sat._pipeline_active is True
@@ -98,8 +127,6 @@ def test_false_wake_then_red_button_silent_abort():
     gen_at_wake = sat._generation
     assert len(chime_callbacks) == 1, "wakeup() must schedule exactly one chime done_callback"
 
-    # User slams the red button before the chime finishes. MQTT subscriber
-    # eventually calls sat.stop("RED_BUTTON_SOFT") on the event loop thread.
     sat.stop(cancel_reason="RED_BUTTON_SOFT")
 
     assert sat._generation == gen_at_wake + 1, "stop() must bump _generation"
@@ -108,12 +135,20 @@ def test_false_wake_then_red_button_silent_abort():
     assert sat._state_label == "IDLE"
     assert sat.state.last_cancel_reason == "RED_BUTTON_SOFT"
 
-    # Belatedly, mpv finishes the chime and invokes the captured done_callback.
-    # This is the late-callback class of bug Stage A neutralises.
     chime_callbacks[0]()
 
     assert sat._is_streaming_audio is False, "Late chime callback wrongly enabled streaming after cancel"
     assert _started_streams(sat.send_messages) == [], "Late chime callback wrongly submitted a stream-start"
+
+    # stop() emits the two HA release messages unconditionally. Both are safe
+    # no-ops on HA when no pipeline_run is in flight (Request(start=False)
+    # routes to _abort_pipeline which handles _pipeline_task is None;
+    # AnnounceFinished sets state=IDLE on an entity already idle). Unconditional
+    # emission is what makes double-press / rapid cancel deterministic.
+    assert _release_messages(sat.send_messages), \
+        "stop() must always emit VoiceAssistantRequest(start=False)"
+    assert _has_message_of(sat.send_messages, VoiceAssistantAnnounceFinished), \
+        "stop() must always emit VoiceAssistantAnnounceFinished"
 
 
 def test_two_false_wakes_in_succession():
@@ -156,7 +191,6 @@ def test_red_button_mid_tts_drops_late_finished_callback():
     sat = _make_bare_satellite()
     tts_callbacks = _capture_done_callbacks(sat.state.tts_player)
 
-    # Simulate the state just after VOICE_ASSISTANT_TTS_END dispatched play_tts.
     sat._tts_url = "http://piper/say.wav"
     sat._pipeline_active = True
     sat._pipeline_start_gen = sat._generation
@@ -168,26 +202,105 @@ def test_red_button_mid_tts_drops_late_finished_callback():
     assert sat._state_label == "SPEAKING"
     assert len(tts_callbacks) == 1, "play_tts() must schedule exactly one _tts_finished callback"
 
-    pre_cancel_send_count = sat.send_messages.call_count
+    sat._ha_pipeline_started = True
 
-    # Red button hits mid-playback.
     sat.stop(cancel_reason="RED_BUTTON_SOFT")
     assert sat._pipeline_active is False
     assert sat._state_label == "IDLE"
+    assert sat._ha_pipeline_started is False, "stop() must clear _ha_pipeline_started"
+    # Two-message HA release sequence — Request(start=False) cancels HA's
+    # pipeline_task; AnnounceFinished forces tts_response_finished → IDLE.
+    # Order matters: Request(start=False) MUST be sent first so no further
+    # PipelineEvent (e.g. TTS_START) re-transitions state to RESPONDING after
+    # AnnounceFinished sets it IDLE.
+    assert _release_messages(sat.send_messages), \
+        "stop() mid-TTS must send VoiceAssistantRequest(start=False) to cancel HA's pipeline_task"
+    assert _has_message_of(sat.send_messages, VoiceAssistantAnnounceFinished), \
+        "stop() mid-TTS must send AnnounceFinished to release HA's responding state"
 
     # mpv's stop() invokes the captured done_callback shortly after cancel.
     tts_callbacks[0]()
 
     # _tts_finished should have been dropped:
-    #   - no VoiceAssistantAnnounceFinished sent post-cancel
+    #   - no second VoiceAssistantAnnounceFinished after the cancel
     #   - no FOLLOWUP transition (state stays IDLE, no new stream started)
     assert sat._state_label == "IDLE", "Late _tts_finished wrongly transitioned to FOLLOWUP"
     assert sat._is_streaming_audio is False, "Late _tts_finished wrongly restarted streaming"
     assert _started_streams(sat.send_messages) == [], "Late _tts_finished wrongly started follow-up stream"
-    # send_messages may have been called by stop() to send stream-end, but
-    # nothing additional should have happened AFTER the late callback ran.
-    # (Conservative assertion: at most one new send for stream-end during stop.)
-    assert sat.send_messages.call_count <= pre_cancel_send_count + 1
+
+
+def test_cancel_mid_thinking_emits_release_sequence():
+    """User wakes, asks a question, presses red button while HA is THINKING.
+    HA's pipeline_run is in flight on its side. stop() must send the two-
+    message release sequence so HA's assist_satellite returns to idle and
+    the Calisto LED resets."""
+    sat = _make_bare_satellite()
+
+    sat._pipeline_active = True
+    sat._is_streaming_audio = False
+    sat._ha_pipeline_started = True
+    sat._pipeline_start_gen = sat._generation
+
+    sat.stop(cancel_reason="RED_BUTTON_SOFT")
+
+    assert sat._ha_pipeline_started is False
+    assert _release_messages(sat.send_messages), \
+        "stop() during THINKING must send VoiceAssistantRequest(start=False) to cancel HA's pipeline_task"
+    assert _has_message_of(sat.send_messages, VoiceAssistantAnnounceFinished), \
+        "stop() during THINKING must send AnnounceFinished to release HA"
+    # No Audio(end=True) — that's the SOFT-stop path which lets HA's pipeline
+    # run to completion, exactly the wrong direction on cancel.
+    audio_msgs = [m for m in _sent_messages(sat.send_messages) if isinstance(m, VoiceAssistantAudio)]
+    assert audio_msgs == [], "stop() must not send VoiceAssistantAudio (soft-stop) on cancel"
+
+
+def test_cancel_mid_listening_emits_release_sequence():
+    """User wakes, presses red button while still talking (LISTENING phase,
+    mic streaming). stop() emits the same two-message release sequence —
+    Request(start=False) is the hard-abort path that cancels HA's
+    pipeline_task regardless of phase."""
+    sat = _make_bare_satellite()
+
+    sat._pipeline_active = True
+    sat._is_streaming_audio = True
+    sat._ha_pipeline_started = True
+    sat._pipeline_start_gen = sat._generation
+
+    sat.stop(cancel_reason="RED_BUTTON_SOFT")
+
+    assert _release_messages(sat.send_messages), \
+        "stop() during LISTENING must send VoiceAssistantRequest(start=False)"
+    assert _has_message_of(sat.send_messages, VoiceAssistantAnnounceFinished), \
+        "stop() during LISTENING must send AnnounceFinished"
+    audio_msgs = [m for m in _sent_messages(sat.send_messages) if isinstance(m, VoiceAssistantAudio)]
+    assert audio_msgs == [], "stop() must not send Audio(end=True) — Request(start=False) is the abort signal"
+
+
+def test_repeat_cancel_emits_release_sequence_each_time():
+    """Forced cancel (double-press) UX: each stop() call must emit the full
+    release sequence. Previous bug: first stop() captured _ha_pipeline_started
+    and cleared it; subsequent stops sent nothing on the wire, leaving HA
+    stuck if the first AnnounceFinished raced with HA's TTS_START."""
+    sat = _make_bare_satellite()
+
+    sat._pipeline_active = True
+    sat._is_streaming_audio = False
+    sat._ha_pipeline_started = True
+    sat._pipeline_start_gen = sat._generation
+
+    sat.stop(cancel_reason="RED_BUTTON_SOFT")
+    after_first = sat.send_messages.call_count
+
+    # Forced cancel: second press immediately after.
+    sat.stop(cancel_reason="RED_BUTTON_SOFT")
+    after_second = sat.send_messages.call_count
+
+    assert after_second > after_first, \
+        "Second cancel must emit messages on the wire (regression of the silent repeat-cancel bug)"
+    assert len(_release_messages(sat.send_messages)) >= 2, \
+        "Each cancel press must emit VoiceAssistantRequest(start=False)"
+    finishes = [m for m in _sent_messages(sat.send_messages) if isinstance(m, VoiceAssistantAnnounceFinished)]
+    assert len(finishes) >= 2, "Each cancel press must emit AnnounceFinished"
 
 
 def test_play_tts_blocked_when_pipeline_start_gen_stale():
