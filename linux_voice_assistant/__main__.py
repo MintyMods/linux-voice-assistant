@@ -437,6 +437,8 @@ async def main() -> None:
 _K3_REASONS = {
     "RED_BUTTON_SOFT",
     "RED_BUTTON_HARD",
+    "MIC_MUTE_SOFT",
+    "MIC_MUTE_HARD",
     "VOICE_STOP_WORD",
     "STOP_EVERYTHING",
     "STOP_WORD_INPROCESS",

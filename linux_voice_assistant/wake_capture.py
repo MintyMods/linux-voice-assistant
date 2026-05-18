@@ -49,6 +49,8 @@ SCHEMA_VERSION = 1
 CancelLabelMap = {
     "RED_BUTTON_SOFT": ("negative", "RED_BUTTON_SOFT"),
     "RED_BUTTON_HARD": ("negative", "RED_BUTTON_HARD"),
+    "MIC_MUTE_SOFT": ("negative", "MIC_MUTE_SOFT"),
+    "MIC_MUTE_HARD": ("negative", "MIC_MUTE_HARD"),
     "STOP_WORD_INPROCESS": ("negative", "STOP_WORD_INPROCESS"),
     "SILENCE_TIMEOUT": ("negative", "SILENCE_TIMEOUT"),
     "GATE2_REJECT": ("gate2_reject", "gate2_reject"),
