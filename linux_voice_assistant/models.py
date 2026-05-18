@@ -156,6 +156,14 @@ class ServerState:
     wake_capture_http: Any = None
     wake_capture_discovery: Any = None
 
+    # Stage E.1 — LED + mute + HID absorbed into LVA.
+    # AudioControl brokers the pause/resume handshake between led/mute.py
+    # and the recorder loop in process_audio (so the USB Audio claim can
+    # be released for true firmware mute). LedController owns the LED +
+    # button + evdev surface.
+    audio_control: Any = None
+    led_controller: Any = None
+
     def save_preferences(self) -> None:
         """Save preferences as JSON."""
         _LOGGER.debug("Saving preferences: %s", self.preferences_path)

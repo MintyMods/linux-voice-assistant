@@ -19,8 +19,10 @@ from pymicro_wakeword import MicroWakeWord, MicroWakeWordFeatures
 from pyopen_wakeword import OpenWakeWord, OpenWakeWordFeatures
 
 from .asr_client import ASRClient
+from .audio_control import AudioControl
 from .bridge_client import BridgeClient
 from .ha_bridge import HABridge
+from .led import LedController
 from .mic_capture import MicCapture, SpeechBuffer
 from .models import Preferences, ServerState
 from .mpv_player import MpvMediaPlayer
@@ -390,6 +392,12 @@ async def main() -> None:
                 _LOGGER.exception("All %d attempts failed to bind on address (%s, %s): %s", max_attempts, host_ip_address, args.port, message)
                 sys.exit(1)
 
+    # Stage E.1 — AudioControl must be on state BEFORE process_audio_thread
+    # starts (the thread captures `state.audio_control` once at entry). The
+    # LedController itself is constructed after Stage B so it can reference
+    # the DeviceSession for cancel routing.
+    state.audio_control = AudioControl()
+
     process_audio_thread = threading.Thread(
         target=process_audio,
         args=(state, mic, args.audio_input_block_size),
@@ -412,6 +420,10 @@ async def main() -> None:
     # holder + K.1 publisher. B3 wires MicCapture/ASR/TTS so the satellite
     # hands off the ASR path to DeviceSession.
     _start_stage_b_components(state, loop)
+
+    # Stage E.1 — LED + mute + HID absorbed into LVA. Build LedController
+    # after DeviceSession so cancel callbacks can route through it.
+    _start_stage_e1_led(state, loop)
 
     # Auto discovery (zeroconf, mDNS)
     discovery = HomeAssistantZeroconf(port=args.port, name=state.name, mac_address=state.mac_address, host_ip_address=host_ip_address)
@@ -758,6 +770,109 @@ def _start_stage_b_components(state: ServerState, loop: asyncio.AbstractEventLoo
     )
 
 
+def _start_stage_e1_led(state: ServerState, loop: asyncio.AbstractEventLoop) -> None:
+    """Construct LedController + wire its callbacks into DeviceSession / HABridge.
+
+    AudioControl must already be on `state` (built before
+    `process_audio_thread.start()`). DeviceSession must already be on `state`
+    (built by `_start_stage_b_components`).
+
+    All callbacks are best-effort: a failure in any one path logs and
+    swallows so a malformed dependency doesn't take down the LED surface.
+    """
+    if state.audio_control is None:
+        _LOGGER.error("Stage E.1: state.audio_control missing — LED disabled")
+        return
+    session = state.device_session
+    if session is None:
+        _LOGGER.error("Stage E.1: state.device_session missing — LED disabled")
+        return
+
+    def _phone_cancel(reason: str) -> None:
+        # Routed onto the asyncio loop by LedController._dispatch_phone_press.
+        try:
+            session._cancel_via_satellite(reason)
+        except Exception:
+            _LOGGER.exception("Stage E.1: phone-cancel routing raised")
+
+    def _phone_button(action: str) -> None:
+        # v0 back-compat — publish the legacy `calisto/<room>/button/
+        # phone/{short,long}` event for HA automations that still listen.
+        bridge = state.ha_bridge
+        publish = getattr(bridge, "publish_phone_button", None) if bridge else None
+        if publish is None:
+            return
+        try:
+            publish(action)
+        except Exception:
+            _LOGGER.exception("Stage E.1: phone-button publish raised")
+
+    def _mic_capture_abort() -> None:
+        mc = state.mic_capture
+        if mc is not None:
+            try:
+                mc.abort()
+            except Exception:
+                _LOGGER.exception("Stage E.1: mic_capture.abort raised")
+
+    def _volume_publish(pct: int) -> None:
+        # ha_bridge MQTT publish wired in Stage E.1 step 11. Until that
+        # lands, surface the change in logs so deploy verification can
+        # confirm the hardware → MQTT path is alive.
+        bridge = state.ha_bridge
+        publish = getattr(bridge, "publish_volume_state", None) if bridge else None
+        if publish is None:
+            _LOGGER.info("Stage E.1: volume → %d%% (no HABridge publisher wired yet)", pct)
+            return
+        try:
+            publish(pct)
+        except Exception:
+            _LOGGER.exception("Stage E.1: HABridge.publish_volume_state raised")
+
+    def _mute_state_changed(muted: bool) -> None:
+        # Mirror to ServerState.muted for process_audio gating (defence-
+        # in-depth — the audio claim is already released while muted).
+        state.muted = muted
+        bridge = state.ha_bridge
+        publish = getattr(bridge, "publish_mute_state", None) if bridge else None
+        if publish is None:
+            _LOGGER.info("Stage E.1: mute → %s (no HABridge publisher wired yet)", muted)
+            return
+        try:
+            publish(muted)
+        except Exception:
+            _LOGGER.exception("Stage E.1: HABridge.publish_mute_state raised")
+
+    controller = LedController(
+        loop=loop,
+        audio_control=state.audio_control,
+        mic_capture_abort=_mic_capture_abort,
+        on_phone_cancel=_phone_cancel,
+        on_phone_button=_phone_button,
+        on_volume_change=_volume_publish,
+        on_mute_state_changed=_mute_state_changed,
+    )
+    try:
+        controller.start()
+    except Exception:
+        _LOGGER.exception("Stage E.1: LedController.start raised — LED surface degraded")
+        return
+    state.led_controller = controller
+    # Wire the back-compat MQTT control plane: HABridge subscribes on
+    # connect, routes inbound topics to controller methods.
+    bridge = state.ha_bridge
+    if bridge is not None:
+        try:
+            bridge.attach_led_controller(controller)
+        except Exception:
+            _LOGGER.exception("Stage E.1: HABridge.attach_led_controller raised")
+    _LOGGER.info(
+        "Stage E.1: LedController started (mute=%s, mqtt=%s)",
+        "Path A" if controller.mute else "cosmetic-fallback",
+        "wired" if bridge is not None else "absent",
+    )
+
+
 def process_audio(state: ServerState, mic, block_size: int):
     """Process audio chunks from the microphone."""
 
@@ -772,223 +887,262 @@ def process_audio(state: ServerState, mic, block_size: int):
     last_active: Optional[float] = None
     webrtc: Optional[WebRTCProcessor] = None
 
-    try:
-        _LOGGER.debug("Opening audio input device: %s", mic.name)
-        with mic.recorder(samplerate=16000, channels=1, blocksize=block_size) as mic_in:
-            while True:
-                audio_chunk_array = mic_in.record(block_size).reshape(-1)
-                # little-endian 16-bit signed
-                mic_vol_scalar = max(0.1, min(1.0, state.mic_volume / 100.0))
-                audio_chunk = (np.clip(audio_chunk_array * mic_vol_scalar, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
-                agc = state.preferences.mic_auto_gain or 0
-                ns = state.preferences.mic_noise_suppression or 0
+    # Stage E.1 — AudioControl coordinates pause/resume of the recorder
+    # context so led/mute.py can release the USB Audio Class claim and
+    # let firmware enter telephony mode for true firmware-level mute.
+    # `None` when AudioControl is not wired (pre-Stage-E.1 startup, tests)
+    # — the loop then behaves exactly as before.
+    audio_ctrl = getattr(state, "audio_control", None)
 
-                if agc > 0 or ns > 0:
-                    if webrtc is None:
-                        webrtc = WebRTCProcessor(agc_level=agc, ns_level=ns)
-                    else:
-                        webrtc.update_settings(agc, ns)
-                    audio_chunk = webrtc.process(audio_chunk)
-                    if not audio_chunk:
+    try:
+        while True:  # outer pause/resume cycle
+            if audio_ctrl is not None and audio_ctrl.is_pause_desired():
+                # Pause requested before we (re)opened the recorder. Confirm
+                # and wait for resume without ever holding the audio claim.
+                _LOGGER.info(
+                    "process_audio: pause requested pre-open; confirming + waiting"
+                )
+                audio_ctrl.confirm_paused()
+                audio_ctrl.wait_for_resume()
+
+            _LOGGER.debug("Opening audio input device: %s", mic.name)
+            with mic.recorder(samplerate=16000, channels=1, blocksize=block_size) as mic_in:
+                if audio_ctrl is not None:
+                    audio_ctrl.confirm_resumed()
+                while True:
+                    if audio_ctrl is not None and audio_ctrl.is_pause_desired():
+                        _LOGGER.info(
+                            "process_audio: pause requested; exiting recorder context"
+                        )
+                        break
+                    audio_chunk_array = mic_in.record(block_size).reshape(-1)
+                    # little-endian 16-bit signed
+                    mic_vol_scalar = max(0.1, min(1.0, state.mic_volume / 100.0))
+                    audio_chunk = (np.clip(audio_chunk_array * mic_vol_scalar, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+                    agc = state.preferences.mic_auto_gain or 0
+                    ns = state.preferences.mic_noise_suppression or 0
+
+                    if agc > 0 or ns > 0:
+                        if webrtc is None:
+                            webrtc = WebRTCProcessor(agc_level=agc, ns_level=ns)
+                        else:
+                            webrtc.update_settings(agc, ns)
+                        audio_chunk = webrtc.process(audio_chunk)
+                        if not audio_chunk:
+                            continue
+
+                    if state.satellite is None or not hasattr(state.satellite, "_is_streaming_audio"):
                         continue
 
-                if state.satellite is None or not hasattr(state.satellite, "_is_streaming_audio"):
-                    continue
+                    # WAKE WORD
+                    if (not wake_words) or (state.wake_words_changed and state.wake_words):
+                        # Update list of wake word models to process
+                        state.wake_words_changed = False
+                        wake_words = [ww for ww in state.wake_words.values() if ww.id in state.active_wake_words]
 
-                # WAKE WORD
-                if (not wake_words) or (state.wake_words_changed and state.wake_words):
-                    # Update list of wake word models to process
-                    state.wake_words_changed = False
-                    wake_words = [ww for ww in state.wake_words.values() if ww.id in state.active_wake_words]
+                        # TODO: Load default stop word value from json into state and preferences missing.
 
-                    # TODO: Load default stop word value from json into state and preferences missing.
+                        has_oww = False
+                        for idx, wake_word in enumerate(wake_words):
 
-                    has_oww = False
-                    for idx, wake_word in enumerate(wake_words):
+                            # Load default threshold from model json
+                            wake_word_id = wake_word.id if hasattr(wake_word, "id") else next(iter(state.wake_words.keys()))
+                            available_word = state.available_wake_words.get(wake_word_id)
+                            # _LOGGER.debug("word= %s", state.available_wake_words.get(wake_word_id))
+                            default_threshold = available_word.probability_cutoff if available_word else 0.7
+                            _LOGGER.debug("Using default threshold %.3f for wake word '%s' from model config", default_threshold, wake_word_id)
+                            # Check preferences override
+                            if idx == 0:
+                                old_val = state.wake_word_1_threshold
+                                if state.preferences.wake_word_1_sensitivity is not None:
+                                    state.wake_word_1_threshold = state.preferences.wake_word_1_sensitivity
+                                else:
+                                    state.wake_word_1_threshold = default_threshold
+                                _LOGGER.debug("Wake Word 1 threshold set to %.3f (was %.3f, preferences: %s)", state.wake_word_1_threshold, old_val, state.preferences.wake_word_1_sensitivity)
+                            elif idx == 1:
+                                old_val = state.wake_word_2_threshold
+                                if state.preferences.wake_word_2_sensitivity is not None:
+                                    state.wake_word_2_threshold = state.preferences.wake_word_2_sensitivity
+                                else:
+                                    state.wake_word_2_threshold = default_threshold
+                                _LOGGER.debug("Wake Word 2 threshold set to %.3f (was %.3f, preferences: %s)", state.wake_word_2_threshold, old_val, state.preferences.wake_word_2_sensitivity)
 
-                        # Load default threshold from model json
-                        wake_word_id = wake_word.id if hasattr(wake_word, "id") else next(iter(state.wake_words.keys()))
-                        available_word = state.available_wake_words.get(wake_word_id)
-                        # _LOGGER.debug("word= %s", state.available_wake_words.get(wake_word_id))
-                        default_threshold = available_word.probability_cutoff if available_word else 0.7
-                        _LOGGER.debug("Using default threshold %.3f for wake word '%s' from model config", default_threshold, wake_word_id)
-                        # Check preferences override
-                        if idx == 0:
-                            old_val = state.wake_word_1_threshold
-                            if state.preferences.wake_word_1_sensitivity is not None:
-                                state.wake_word_1_threshold = state.preferences.wake_word_1_sensitivity
-                            else:
-                                state.wake_word_1_threshold = default_threshold
-                            _LOGGER.debug("Wake Word 1 threshold set to %.3f (was %.3f, preferences: %s)", state.wake_word_1_threshold, old_val, state.preferences.wake_word_1_sensitivity)
-                        elif idx == 1:
-                            old_val = state.wake_word_2_threshold
-                            if state.preferences.wake_word_2_sensitivity is not None:
-                                state.wake_word_2_threshold = state.preferences.wake_word_2_sensitivity
-                            else:
-                                state.wake_word_2_threshold = default_threshold
-                            _LOGGER.debug("Wake Word 2 threshold set to %.3f (was %.3f, preferences: %s)", state.wake_word_2_threshold, old_val, state.preferences.wake_word_2_sensitivity)
+                            if isinstance(wake_word, OpenWakeWord):
+                                has_oww = True
 
-                        if isinstance(wake_word, OpenWakeWord):
-                            has_oww = True
-
-                    # Sync entity states after threshold values were updated
-                    if state.satellite is not None:
-                        _LOGGER.debug("Updating WebUI entities with new threshold values")
-
-                        # Wake Word 1
-                        if state.satellite.state.sensitivity_1_number_entity is not None:
-                            _LOGGER.debug("  → Syncing Wake Word 1 entity to value %.3f", state.wake_word_1_threshold)
-                            state.satellite.state.sensitivity_1_number_entity.sync_with_state()
-                            _LOGGER.debug("  ✅ Wake Word 1 entity now has value %.3f", state.satellite.state.sensitivity_1_number_entity.value)
-
-                        # Wake Word 2
-                        if state.satellite.state.sensitivity_2_number_entity is not None:
-                            _LOGGER.debug("  → Syncing Wake Word 2 entity to value %.3f", state.wake_word_2_threshold)
-                            state.satellite.state.sensitivity_2_number_entity.sync_with_state()
-                            _LOGGER.debug("  ✅ Wake Word 2 entity now has value %.3f", state.satellite.state.sensitivity_2_number_entity.value)
-
-                        # Stop Word
-                        if state.satellite.state.stop_sensitivity_number_entity is not None:
-                            _LOGGER.debug("  → Syncing Stop Word entity to value %.3f", state.stop_word_threshold)
-                            state.satellite.state.stop_sensitivity_number_entity.sync_with_state()
-                            _LOGGER.debug("  ✅ Stop Word entity now has value %.3f", state.satellite.state.stop_sensitivity_number_entity.value)
-
-                        _LOGGER.debug("All sensitivity entities synced successfully")
-
-                        # Force push new state to connected Home Assistant instance
+                        # Sync entity states after threshold values were updated
                         if state.satellite is not None:
+                            _LOGGER.debug("Updating WebUI entities with new threshold values")
+
+                            # Wake Word 1
+                            if state.satellite.state.sensitivity_1_number_entity is not None:
+                                _LOGGER.debug("  → Syncing Wake Word 1 entity to value %.3f", state.wake_word_1_threshold)
+                                state.satellite.state.sensitivity_1_number_entity.sync_with_state()
+                                _LOGGER.debug("  ✅ Wake Word 1 entity now has value %.3f", state.satellite.state.sensitivity_1_number_entity.value)
+
+                            # Wake Word 2
+                            if state.satellite.state.sensitivity_2_number_entity is not None:
+                                _LOGGER.debug("  → Syncing Wake Word 2 entity to value %.3f", state.wake_word_2_threshold)
+                                state.satellite.state.sensitivity_2_number_entity.sync_with_state()
+                                _LOGGER.debug("  ✅ Wake Word 2 entity now has value %.3f", state.satellite.state.sensitivity_2_number_entity.value)
+
+                            # Stop Word
+                            if state.satellite.state.stop_sensitivity_number_entity is not None:
+                                _LOGGER.debug("  → Syncing Stop Word entity to value %.3f", state.stop_word_threshold)
+                                state.satellite.state.stop_sensitivity_number_entity.sync_with_state()
+                                _LOGGER.debug("  ✅ Stop Word entity now has value %.3f", state.satellite.state.stop_sensitivity_number_entity.value)
+
+                            _LOGGER.debug("All sensitivity entities synced successfully")
+
+                            # Force push new state to connected Home Assistant instance
+                            if state.satellite is not None:
+                                try:
+                                    _LOGGER.debug("Pushing updated state values to Home Assistant")
+                                    for entity in [
+                                        state.satellite.state.sensitivity_1_number_entity,
+                                        state.satellite.state.sensitivity_2_number_entity,
+                                        state.satellite.state.stop_sensitivity_number_entity,
+                                    ]:
+                                        if entity is not None:
+                                            state.satellite.send_messages([NumberStateResponse(key=entity.key, state=entity.value)])  # type: ignore[attr-defined]
+                                            _LOGGER.debug("  → Pushed value %.3f for entity %d", entity.value, entity.key)
+                                except Exception as e:
+                                    _LOGGER.debug("Could not push state (no client connected yet): %s", e)
+
+                        # TODO: Save settings: At this moment settings are only saved when changed in the UI. Means that the default value can change while updating since its not saved in preferences.
+
+                        if micro_features is None:
+                            micro_features = MicroWakeWordFeatures()
+
+                        if has_oww and (oww_features is None):
+                            oww_features = OpenWakeWordFeatures.from_builtin()
+
+                    try:
+                        state.satellite.handle_audio(audio_chunk)
+
+                        # Stage B3 — feed the v1 mic-capture path. The ring buffer
+                        # always fills (for pre-roll); capture-active state is
+                        # internal to MicCapture. Safe no-op when not wired.
+                        if state.mic_capture is not None:
                             try:
-                                _LOGGER.debug("Pushing updated state values to Home Assistant")
-                                for entity in [
-                                    state.satellite.state.sensitivity_1_number_entity,
-                                    state.satellite.state.sensitivity_2_number_entity,
-                                    state.satellite.state.stop_sensitivity_number_entity,
-                                ]:
-                                    if entity is not None:
-                                        state.satellite.send_messages([NumberStateResponse(key=entity.key, state=entity.value)])  # type: ignore[attr-defined]
-                                        _LOGGER.debug("  → Pushed value %.3f for entity %d", entity.value, entity.key)
-                            except Exception as e:
-                                _LOGGER.debug("Could not push state (no client connected yet): %s", e)
+                                state.mic_capture.feed(audio_chunk)
+                            except Exception:
+                                _LOGGER.exception("MicCapture.feed raised")
 
-                    # TODO: Save settings: At this moment settings are only saved when changed in the UI. Means that the default value can change while updating since its not saved in preferences.
+                        # Stage C — feed the wake-capture ring buffer. Independent
+                        # of MicCapture: WakeCapture always tracks the 3s window
+                        # leading up to a wake fire, while MicCapture only buffers
+                        # the post-wake utterance. O(1) per chunk; safe no-op
+                        # when wake_capture isn't wired.
+                        if state.wake_capture is not None:
+                            try:
+                                state.wake_capture.feed(audio_chunk)
+                            except Exception:
+                                _LOGGER.exception("WakeCapture.feed raised")
 
-                    if micro_features is None:
-                        micro_features = MicroWakeWordFeatures()
+                        assert micro_features is not None
+                        micro_inputs.clear()
+                        micro_inputs.extend(micro_features.process_streaming(audio_chunk))
 
-                    if has_oww and (oww_features is None):
-                        oww_features = OpenWakeWordFeatures.from_builtin()
+                        if has_oww:
+                            assert oww_features is not None
+                            oww_inputs.clear()
+                            oww_inputs.extend(oww_features.process_streaming(audio_chunk))
 
-                try:
-                    state.satellite.handle_audio(audio_chunk)
+                        for wake_word_index, wake_word in enumerate(wake_words):
+                            activated = False
+                            activation_score = 0.0
 
-                    # Stage B3 — feed the v1 mic-capture path. The ring buffer
-                    # always fills (for pre-roll); capture-active state is
-                    # internal to MicCapture. Safe no-op when not wired.
-                    if state.mic_capture is not None:
-                        try:
-                            state.mic_capture.feed(audio_chunk)
-                        except Exception:
-                            _LOGGER.exception("MicCapture.feed raised")
+                            # Set dynamic threshold depending on wake word index
+                            if wake_word_index == 0:
+                                threshold = state.wake_word_1_threshold
+                                # _LOGGER.debug("Set wake word %d probability cutoff to %.3f", wake_word_index+1, state.wake_word_1_threshold)
+                            elif wake_word_index == 1:
+                                threshold = state.wake_word_2_threshold
+                                # _LOGGER.debug("Set wake word %d probability cutoff to %.3f", wake_word_index+1, state.wake_word_2_threshold)
+                            else:
+                                threshold = 0.7
+                                # _LOGGER.debug("Set wake word %d probability cutoff to fallback value 0.7", wake_word_index+1)
 
-                    # Stage C — feed the wake-capture ring buffer. Independent
-                    # of MicCapture: WakeCapture always tracks the 3s window
-                    # leading up to a wake fire, while MicCapture only buffers
-                    # the post-wake utterance. O(1) per chunk; safe no-op
-                    # when wake_capture isn't wired.
-                    if state.wake_capture is not None:
-                        try:
-                            state.wake_capture.feed(audio_chunk)
-                        except Exception:
-                            _LOGGER.exception("WakeCapture.feed raised")
+                            if isinstance(wake_word, MicroWakeWord):
+                                # No debugging when no detection
+                                wake_word.debug_probabilities = False
 
-                    assert micro_features is not None
-                    micro_inputs.clear()
-                    micro_inputs.extend(micro_features.process_streaming(audio_chunk))
+                                # set microWakeWord cutoff
+                                wake_word.probability_cutoff = threshold
 
-                    if has_oww:
-                        assert oww_features is not None
-                        oww_inputs.clear()
-                        oww_inputs.extend(oww_features.process_streaming(audio_chunk))
-
-                    for wake_word_index, wake_word in enumerate(wake_words):
-                        activated = False
-                        activation_score = 0.0
-
-                        # Set dynamic threshold depending on wake word index
-                        if wake_word_index == 0:
-                            threshold = state.wake_word_1_threshold
-                            # _LOGGER.debug("Set wake word %d probability cutoff to %.3f", wake_word_index+1, state.wake_word_1_threshold)
-                        elif wake_word_index == 1:
-                            threshold = state.wake_word_2_threshold
-                            # _LOGGER.debug("Set wake word %d probability cutoff to %.3f", wake_word_index+1, state.wake_word_2_threshold)
-                        else:
-                            threshold = 0.7
-                            # _LOGGER.debug("Set wake word %d probability cutoff to fallback value 0.7", wake_word_index+1)
-
-                        if isinstance(wake_word, MicroWakeWord):
-                            # No debugging when no detection
-                            wake_word.debug_probabilities = False
-
-                            # set microWakeWord cutoff
-                            wake_word.probability_cutoff = threshold
-
-                            for micro_input in micro_inputs:
-                                if wake_word.process_streaming(micro_input):
-                                    wake_word.debug_probabilities = True
-                                    activated = True
-                                    # MicroWakeWord doesn't expose prob over
-                                    # process_streaming — use threshold as a
-                                    # floor estimate for the sidecar.
-                                    activation_score = max(activation_score, threshold)
-                        elif isinstance(wake_word, OpenWakeWord):
-                            for oww_input in oww_inputs:
-                                for prob in wake_word.process_streaming(oww_input):
-                                    if prob > threshold:
-                                        _LOGGER.debug("Wake word '%s' activated (probability %.3f exceeded threshold %.3f)", wake_word.wake_word, prob, threshold)  # type: ignore[attr-defined]
+                                for micro_input in micro_inputs:
+                                    if wake_word.process_streaming(micro_input):
+                                        wake_word.debug_probabilities = True
                                         activated = True
-                                        if prob > activation_score:
-                                            activation_score = float(prob)
+                                        # MicroWakeWord doesn't expose prob over
+                                        # process_streaming — use threshold as a
+                                        # floor estimate for the sidecar.
+                                        activation_score = max(activation_score, threshold)
+                            elif isinstance(wake_word, OpenWakeWord):
+                                for oww_input in oww_inputs:
+                                    for prob in wake_word.process_streaming(oww_input):
+                                        if prob > threshold:
+                                            _LOGGER.debug("Wake word '%s' activated (probability %.3f exceeded threshold %.3f)", wake_word.wake_word, prob, threshold)  # type: ignore[attr-defined]
+                                            activated = True
+                                            if prob > activation_score:
+                                                activation_score = float(prob)
 
-                        if activated and not state.muted:
-                            # Check refractory
-                            now = time.monotonic()
-                            if (last_active is None) or ((now - last_active) > state.refractory_seconds):
-                                # Stage C — capture the 3s window for the
-                                # retraining dataset before wakeup() runs, so
-                                # the WAV's audio matches the wake-fire moment.
-                                wake_id = None
-                                if state.wake_capture is not None:
-                                    try:
-                                        wake_id = state.wake_capture.on_wake_fire(
-                                            score=activation_score,
-                                            peak_score=activation_score,
-                                            model=getattr(wake_word, "wake_word", None),
-                                            sensitivity=threshold,
-                                        )
-                                    except Exception:
-                                        _LOGGER.exception("WakeCapture.on_wake_fire raised")
-                                state.satellite.wakeup(wake_word, wake_id=wake_id)
-                                last_active = now
+                            if activated and not state.muted:
+                                # Check refractory
+                                now = time.monotonic()
+                                if (last_active is None) or ((now - last_active) > state.refractory_seconds):
+                                    # Stage C — capture the 3s window for the
+                                    # retraining dataset before wakeup() runs, so
+                                    # the WAV's audio matches the wake-fire moment.
+                                    wake_id = None
+                                    if state.wake_capture is not None:
+                                        try:
+                                            wake_id = state.wake_capture.on_wake_fire(
+                                                score=activation_score,
+                                                peak_score=activation_score,
+                                                model=getattr(wake_word, "wake_word", None),
+                                                sensitivity=threshold,
+                                            )
+                                        except Exception:
+                                            _LOGGER.exception("WakeCapture.on_wake_fire raised")
+                                    state.satellite.wakeup(wake_word, wake_id=wake_id)
+                                    last_active = now
 
-                    # Always process to keep state correct
-                    stopped = False
+                        # Always process to keep state correct
+                        stopped = False
 
-                    # No debugging when no detection
-                    state.stop_word.debug_probabilities = False
+                        # No debugging when no detection
+                        state.stop_word.debug_probabilities = False
 
-                    # Apply stop word sensitivity threshold
-                    state.stop_word.probability_cutoff = state.stop_word_threshold
-                    # _LOGGER.debug("Set stop word probability cutoff to %.3f", state.stop_word_threshold)
-                    for micro_input in micro_inputs:
-                        if state.stop_word.process_streaming(micro_input):
-                            state.stop_word.debug_probabilities = True
-                            stopped = True
+                        # Apply stop word sensitivity threshold
+                        state.stop_word.probability_cutoff = state.stop_word_threshold
+                        # _LOGGER.debug("Set stop word probability cutoff to %.3f", state.stop_word_threshold)
+                        for micro_input in micro_inputs:
+                            if state.stop_word.process_streaming(micro_input):
+                                state.stop_word.debug_probabilities = True
+                                stopped = True
 
-                    if stopped and (state.stop_word.id in state.active_wake_words) and not state.muted:
-                        _LOGGER.debug("Stop word detected")
-                        state.satellite.stop(cancel_reason="STOP_WORD_INPROCESS")
-                except Exception:
-                    _LOGGER.exception("Unexpected error handling audio")
+                        if stopped and (state.stop_word.id in state.active_wake_words) and not state.muted:
+                            _LOGGER.debug("Stop word detected")
+                            state.satellite.stop(cancel_reason="STOP_WORD_INPROCESS")
+                    except Exception:
+                        _LOGGER.exception("Unexpected error handling audio")
+            # Inner `while` broke out — pause was requested. The `with`
+            # block has now exited; the audio claim is released as far
+            # as soundcard / ALSA / PipeWire are concerned. led/mute.py
+            # still sleeps a short settle (STREAM_CLOSE_WAIT_SEC) after
+            # `request_pause` returns, because firmware sensing the
+            # release lags the userspace context exit.
+            if audio_ctrl is not None:
+                audio_ctrl.confirm_paused()
+                audio_ctrl.wait_for_resume()
+                # fall through to outer `while True` → re-enter recorder
+            else:
+                # No AudioControl wired but we broke out of the inner
+                # loop somehow (shouldn't happen with the current guards
+                # — only an exception would have left the inner loop).
+                break
     except Exception:
         _LOGGER.exception("Unexpected error processing audio")
         sys.exit(1)

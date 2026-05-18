@@ -51,14 +51,33 @@ class HABridge:
         self.state_topic = f"calisto/{room}/session/state"
         # B3 stop-gap: also drive the legacy `calisto/<room>/led/set` control
         # plane so the existing calisto-led service lights the red phone LED.
-        # Stage E absorbs LED control into LVA proper.
+        # Stage E.1 absorbs the consumer side; the stop-gap mirror still
+        # fires here for any HA automation that historically listened on
+        # this topic. Once `calisto-led.service` is decommissioned (Stage
+        # E.1 step 13) the mirror is harmless — nothing is listening.
         self.led_topic = f"calisto/{room}/led/set"
+        # Stage E.1 — back-compat control topics consumed from HA / v0
+        # automations. LedController is attached via `attach_led_controller`.
+        self.led_set_room_topic = f"calisto/{room}/led/set"
+        self.led_set_all_topic = "calisto/all/led/set"
+        self.volume_set_topic = f"calisto/{room}/volume/set"
+        self.ring_set_topic = f"calisto/{room}/ring/set"
+        # Retained state topics — Lovelace cards + v0 automations read these.
+        self.led_state_topic = f"calisto/{room}/led/state"
+        self.volume_state_topic = f"calisto/{room}/volume/state"
+        self.mute_state_topic = f"calisto/{room}/mute/state"
+        self.ring_state_topic = f"calisto/{room}/ring/state"
+        self.availability_topic = f"calisto/{room}/availability"
+        # Phone-button events (not retained — these are momentary).
+        self.phone_short_topic = f"calisto/{room}/button/phone/short"
+        self.phone_long_topic = f"calisto/{room}/button/phone/long"
         # client_factory(client_id, clean_session) -> client.  When None,
         # start() imports paho.mqtt.client and uses its real Client class.
         # Tests inject a factory returning FakeMqttClient.
         self._client_factory = client_factory
         self._client: Any = None
         self._connected = False
+        self._led_controller: Any = None
 
     def _lwt_payload(self) -> str:
         return json.dumps(
@@ -93,6 +112,7 @@ class HABridge:
         client.will_set(self.state_topic, self._lwt_payload(), qos=1, retain=True)
         client.on_connect = self._on_connect
         client.on_disconnect = self._on_disconnect
+        client.on_message = self._on_message
         client.reconnect_delay_set(min_delay=1, max_delay=30)
         try:
             client.connect_async(self.host, self.port, keepalive=60)
@@ -122,6 +142,28 @@ class HABridge:
                 self.port,
                 self.state_topic,
             )
+            # Publish online availability for any v0 automation that
+            # tracks `calisto/<room>/availability`. LWT on the K.1 state
+            # topic still fires on ungraceful disconnect; the availability
+            # topic is the v0-era equivalent for the LED control plane.
+            try:
+                _c.publish(self.availability_topic, "online", qos=1, retain=True)
+            except Exception:
+                _LOGGER.exception("HABridge availability publish failed")
+            # Stage E.1 — subscribe to back-compat control topics so HA
+            # scripts / Lovelace cards keep working. Routing is via the
+            # attached LedController.
+            try:
+                _c.subscribe(
+                    [
+                        (self.led_set_room_topic, 1),
+                        (self.led_set_all_topic, 1),
+                        (self.volume_set_topic, 1),
+                        (self.ring_set_topic, 1),
+                    ]
+                )
+            except Exception:
+                _LOGGER.exception("HABridge subscribe failed")
         else:
             _LOGGER.error("HABridge connect failed rc=%s", rc)
 
@@ -176,14 +218,19 @@ class HABridge:
             _LOGGER.exception("HABridge.publish_state failed for topic %s", self.state_topic)
 
         # B3 stop-gap LED mirror — the v0 calisto-led service consumes:
-        #   wake|processing|complete|off|error  on calisto/<room>/led/set
-        # Stage E will absorb LED control into LVA proper (E1..E6).
-        led_cmd = _STATE_TO_LED.get(state_value)
-        if led_cmd is not None:
-            try:
-                client.publish(self.led_topic, led_cmd, qos=1, retain=False)
-            except Exception:
-                _LOGGER.exception("HABridge LED mirror failed for topic %s", self.led_topic)
+        #   wake|processing|complete|off|error  on calisto/<room>/led/set.
+        # Stage E.1 absorbs LED control in-process; once a LedController
+        # is attached we MUST NOT publish here too, because we also
+        # subscribe to the same topic — every K.1 transition would echo
+        # back through `apply_legacy` and re-paint the palette out of
+        # order on rapid sequences (visible flicker).
+        if self._led_controller is None:
+            led_cmd = _STATE_TO_LED.get(state_value)
+            if led_cmd is not None:
+                try:
+                    client.publish(self.led_topic, led_cmd, qos=1, retain=False)
+                except Exception:
+                    _LOGGER.exception("HABridge LED mirror failed for topic %s", self.led_topic)
 
 
 # Map K.1 states to legacy calisto-led `led/set` commands.  See
@@ -196,3 +243,89 @@ _STATE_TO_LED = {
     State.FOLLOWUP.value: "wake",
     State.IDLE.value: "off",
 }
+
+
+# ---------------------------------------------------------------------------
+# Stage E.1 — back-compat MQTT surface
+#
+# Method patches below extend HABridge with the publish + subscribe handlers
+# the absorbed LED + mute + volume system needs to mirror v0 behaviour.
+# Kept after the class to keep the original Stage B class shape readable.
+# ---------------------------------------------------------------------------
+
+
+def _attach_led_controller(self: HABridge, controller: Any) -> None:
+    """Wire a LedController to receive routed MQTT control messages.
+
+    Idempotent — calling twice replaces the previous controller. Useful
+    for tests; production sets it once at startup.
+    """
+    self._led_controller = controller
+
+
+def _on_message(self: HABridge, _client: Any, _userdata: Any, msg: Any) -> None:
+    """Route a subscribed control topic to the attached LedController.
+
+    Topics:
+        calisto/<room>/led/set      → controller.apply_legacy(payload)
+        calisto/all/led/set         → controller.apply_legacy(payload)
+        calisto/<room>/volume/set   → controller.bar.apply(payload)
+        calisto/<room>/ring/set     → controller.ring.start() / .stop()
+    """
+    controller = self._led_controller
+    if controller is None:
+        return
+    try:
+        topic = msg.topic
+        payload = msg.payload.decode("utf-8", errors="replace").strip().lower()
+    except Exception:
+        _LOGGER.exception("HABridge: malformed MQTT message")
+        return
+    _LOGGER.debug("HABridge recv %s = %r", topic, payload)
+    try:
+        if topic in (self.led_set_room_topic, self.led_set_all_topic):
+            controller.apply_legacy(payload)
+        elif topic == self.volume_set_topic:
+            controller.bar.apply(payload)
+        elif topic == self.ring_set_topic:
+            if payload in ("on", "start", "1", "true"):
+                controller.ring.start()
+                self.publish_ring_state(True)
+            else:
+                controller.ring.stop()
+                self.publish_ring_state(False)
+    except Exception:
+        _LOGGER.exception("HABridge: routing %s = %r raised", topic, payload)
+
+
+def _publish_volume_state(self: HABridge, pct: int) -> None:
+    """Publish retained `calisto/<room>/volume/state` = `<pct>`."""
+    self.publish(self.volume_state_topic, str(int(pct)), qos=1, retain=True)
+
+
+def _publish_mute_state(self: HABridge, muted: bool) -> None:
+    """Publish retained `calisto/<room>/mute/state` = `on` | `off`."""
+    self.publish(self.mute_state_topic, "on" if muted else "off", qos=1, retain=True)
+
+
+def _publish_ring_state(self: HABridge, ringing: bool) -> None:
+    """Publish retained `calisto/<room>/ring/state` = `on` | `off`."""
+    self.publish(self.ring_state_topic, "on" if ringing else "off", qos=1, retain=True)
+
+
+def _publish_phone_button(self: HABridge, action: str) -> None:
+    """Publish a (non-retained) phone-button event for v0 HA automations
+    that gated on `calisto/<room>/button/phone/{short,long}`."""
+    if action == "long":
+        topic = self.phone_long_topic
+    else:
+        topic = self.phone_short_topic
+    self.publish(topic, "press", qos=1, retain=False)
+
+
+HABridge.attach_led_controller = _attach_led_controller  # type: ignore[attr-defined]
+HABridge._on_message = _on_message  # type: ignore[attr-defined]
+HABridge.publish_volume_state = _publish_volume_state  # type: ignore[attr-defined]
+HABridge.publish_mute_state = _publish_mute_state  # type: ignore[attr-defined]
+HABridge.publish_ring_state = _publish_ring_state  # type: ignore[attr-defined]
+HABridge.publish_phone_button = _publish_phone_button  # type: ignore[attr-defined]

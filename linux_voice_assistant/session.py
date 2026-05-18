@@ -172,6 +172,19 @@ class DeviceSession:
 
         self._publish(reason=reason, cancel_reason=cancel_reason)
 
+        # Stage E.1 — drive the absorbed LED surface from K.1 transitions.
+        # LedController owns the state→palette mapping; we just hand it the
+        # new state. Best-effort: a raise here must not break the state
+        # machine.
+        led = getattr(self.state, "led_controller", None)
+        if led is not None:
+            try:
+                led.on_state(target, cancel_reason=cancel_reason)
+            except Exception:
+                _LOGGER.exception(
+                    "LedController.on_state raised; swallowing to keep state machine alive"
+                )
+
         # Stage C — wake_capture bind / label hooks. Bind happens when a new
         # session_id has just been minted (IDLE → non-IDLE) and the satellite
         # has a pending wake_id from the most recent wake-fire. Label happens

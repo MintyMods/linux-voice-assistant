@@ -58,6 +58,11 @@ class FakeMqttClient:
         self.loop_stopped = False
         self.disconnected = False
         self.publishes: List[Tuple[str, str, int, bool]] = []
+        # Stage E.1 — HABridge._on_connect subscribes to back-compat
+        # control topics. Without a `subscribe` method here, the
+        # AttributeError was swallowed silently in HABridge's try/except,
+        # masking regressions to the topic list or QoS.
+        self.subscriptions: List[Tuple[str, int]] = []
 
     def will_set(self, topic: str, payload: str, qos: int = 0, retain: bool = False) -> None:
         if self.connect_args is not None:
@@ -87,6 +92,15 @@ class FakeMqttClient:
         self.disconnected = True
         if self.on_disconnect is not None:
             self.on_disconnect(self, None)
+
+    def subscribe(self, topics: Any) -> None:
+        """Record subscriptions. Accepts paho's list-of-(topic, qos)
+        form or a single (topic, qos) tuple."""
+        if isinstance(topics, list):
+            for t in topics:
+                self.subscriptions.append(tuple(t))  # type: ignore[arg-type]
+        else:
+            self.subscriptions.append(tuple(topics))  # type: ignore[arg-type]
 
     def publish(self, topic: str, payload: str, qos: int = 0, retain: bool = False):
         self.publishes.append((topic, payload, qos, retain))
