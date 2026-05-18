@@ -129,9 +129,14 @@ class DeviceSession:
             return
 
         # session_id lifecycle: any move out of IDLE that lacks a session_id
-        # mints one; move into IDLE clears it.
+        # mints one; move into IDLE clears it. Stage C: prev_session_id is
+        # captured before clearing so wake_capture.update_label can resolve
+        # the sidecar by the session_id that's about to disappear.
+        prev_session_id = self._session_id
+        minted_session_id = False
         if prev == State.IDLE and target != State.IDLE and self._session_id is None:
             self._session_id = str(uuid.uuid4())
+            minted_session_id = True
         if target == State.IDLE:
             self._session_id = None
 
@@ -164,6 +169,35 @@ class DeviceSession:
                 pass
 
         self._publish(reason=reason, cancel_reason=cancel_reason)
+
+        # Stage C — wake_capture bind / label hooks. Bind happens when a new
+        # session_id has just been minted (IDLE → non-IDLE) and the satellite
+        # has a pending wake_id from the most recent wake-fire. Label happens
+        # when a session_id is being cleared (any → IDLE) — we use the
+        # prev_session_id captured above. Both are best-effort; failures
+        # never break the state machine.
+        wake_capture = getattr(self.state, "wake_capture", None)
+        if wake_capture is not None:
+            if minted_session_id and sat is not None:
+                pending_wake_id = getattr(sat, "_pending_wake_id", None)
+                if pending_wake_id and self._session_id is not None:
+                    try:
+                        wake_capture.bind_session(
+                            pending_wake_id, self._session_id, self._generation
+                        )
+                    except Exception:
+                        _LOGGER.exception("wake_capture.bind_session raised; swallowing")
+                    try:
+                        sat._pending_wake_id = None
+                    except AttributeError:
+                        pass
+            if target == State.IDLE and prev_session_id is not None:
+                try:
+                    wake_capture.update_label(
+                        prev_session_id, reason=reason, cancel_reason=cancel_reason
+                    )
+                except Exception:
+                    _LOGGER.exception("wake_capture.update_label raised; swallowing")
 
     def publish_current(self, *, reason: str = "transition", cancel_reason: Optional[str] = None) -> None:
         """Re-publish current state (used by Stage F watchdog; kept here as

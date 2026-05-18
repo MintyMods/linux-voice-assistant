@@ -151,6 +151,11 @@ class ServerState:
     # (process_audio stop-word path, paho MQTT callbacks). Set once in main().
     loop: Any = None
 
+    # Stage C — wake-capture retraining loop (D1, M.1).
+    wake_capture: Any = None
+    wake_capture_http: Any = None
+    wake_capture_discovery: Any = None
+
     def save_preferences(self) -> None:
         """Save preferences as JSON."""
         _LOGGER.debug("Saving preferences: %s", self.preferences_path)

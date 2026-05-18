@@ -129,6 +129,24 @@ class HABridge:
         self._connected = False
         _LOGGER.warning("HABridge disconnected from MQTT broker; LWT may have fired")
 
+    def publish(self, topic: str, payload: str, *, qos: int = 1, retain: bool = True) -> bool:
+        """Publish an arbitrary MQTT message via the HABridge's connected
+        client. Returns True when the publish was queued (paho handles
+        offline buffering); False when there is no client yet.
+
+        Added for Stage C Discovery — keeps Stage F's mqtt_router consolidation
+        from being blocked on multiple paho clients in B3.
+        """
+        client = self._client
+        if client is None:
+            return False
+        try:
+            client.publish(topic, payload, qos=qos, retain=retain)
+            return True
+        except Exception:
+            _LOGGER.exception("HABridge.publish failed for topic %s", topic)
+            return False
+
     def publish_state(
         self,
         *,

@@ -347,6 +347,10 @@ class VoiceSatelliteProtocol(APIServer):
         # to idle. Cleared on AnnounceFinished + every stop().
         self._ha_pipeline_started: bool = False
 
+        # Stage C — wake_capture binding. Set by wakeup() and consumed by
+        # DeviceSession.transition_to(WAKING) where session_id is minted.
+        self._pending_wake_id: Optional[str] = None
+
     # ------------------------------------------------------------------
     # Stage A — generation counter + K.1 session/state publish
     # ------------------------------------------------------------------
@@ -725,7 +729,17 @@ class VoiceSatelliteProtocol(APIServer):
 
         self.send_messages([VoiceAssistantAudio(data=audio_chunk)])
 
-    def wakeup(self, wake_word: Union[MicroWakeWord, OpenWakeWord]) -> None:
+    def wakeup(
+        self,
+        wake_word: Union[MicroWakeWord, OpenWakeWord],
+        *,
+        wake_id: Optional[str] = None,
+    ) -> None:
+        # Stash the wake_id (Stage C) so DS.transition_to(WAKING) can bind
+        # session_id ↔ wake_id atomically when it mints the session_id.
+        # Last-write-wins is fine: if a previous wake_id is still pending,
+        # its capture is orphan-swept after 60s.
+        self._pending_wake_id = wake_id
         if self._timer_finished:
             # Stop the ringing timer, then start a normal wake-up after a short
             # delay so the transition doesn't feel abrupt.

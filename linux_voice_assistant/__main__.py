@@ -27,6 +27,9 @@ from .mpv_player import MpvMediaPlayer
 from .satellite import VoiceSatelliteProtocol
 from .session import DeviceSession
 from .tts_output import TTSOutput
+from .discovery import WakeCaptureDiscovery
+from .wake_capture import WakeCapture
+from .wake_capture_http import WakeCaptureHTTP
 from .util import (
     get_default_interface,
     get_default_ipv4,
@@ -675,6 +678,75 @@ def _start_stage_b_components(state: ServerState, loop: asyncio.AbstractEventLoo
             state.tts_output is not None,
         )
 
+    # Stage C — wake-capture retraining loop. Always-on once env is present;
+    # decoupled from MicCapture wiring so we still gather captures even when
+    # the v1 audio path is degraded.
+    wake_capture_dir = os.environ.get(
+        "WAKE_CAPTURE_DIR",
+        str(Path.home() / "wake_captures"),
+    )
+    try:
+        wake_capture_max = int(os.environ.get("WAKE_CAPTURE_MAX_FILES", "5000"))
+    except ValueError:
+        wake_capture_max = 5000
+    device_id = os.environ.get("DEVICE_ID")
+    if not device_id and hasattr(os, "uname"):
+        try:
+            device_id = os.uname().nodename
+        except Exception:
+            device_id = None
+    device_id = device_id or room
+    try:
+        wake_capture = WakeCapture(
+            capture_dir=Path(wake_capture_dir),
+            room=room,
+            device_id=device_id,
+            max_files=wake_capture_max,
+        )
+        wake_capture.attach_loop(loop)
+        state.wake_capture = wake_capture
+        loop.create_task(wake_capture.start_background_sweeps())
+        _LOGGER.info(
+            "WakeCapture initialised (dir=%s max=%d)",
+            wake_capture_dir, wake_capture_max,
+        )
+    except Exception:
+        _LOGGER.exception("WakeCapture construction failed; Stage C disabled")
+
+    if state.wake_capture is not None:
+        try:
+            http_port = int(os.environ.get("WAKE_CAPTURE_HTTP_PORT", "8770"))
+        except ValueError:
+            http_port = 8770
+        http_host = os.environ.get("WAKE_CAPTURE_HTTP_HOST", "0.0.0.0")
+        try:
+            wake_http = WakeCaptureHTTP(
+                wake_capture=state.wake_capture,
+                host=http_host,
+                port=http_port,
+            )
+            wake_http.start()
+            state.wake_capture_http = wake_http
+        except Exception:
+            _LOGGER.exception("WakeCaptureHTTP failed to start; triage endpoint disabled")
+
+    if state.wake_capture is not None and state.ha_bridge is not None:
+        http_advertise = os.environ.get("WAKE_CAPTURE_HTTP_ADVERTISE_URL")
+        if not http_advertise and state.wake_capture_http is not None:
+            http_advertise = f"http://{device_id}:{state.wake_capture_http.port}"
+        try:
+            discovery = WakeCaptureDiscovery(
+                ha_bridge=state.ha_bridge,
+                wake_capture=state.wake_capture,
+                room=room,
+                device_id=device_id,
+                http_base_url=http_advertise,
+            )
+            loop.create_task(discovery.start())
+            state.wake_capture_discovery = discovery
+        except Exception:
+            _LOGGER.exception("WakeCaptureDiscovery construction failed")
+
     # Stage F placeholders — surfaced into logs so deploy-time misconfigs
     # are visible before F lands the watchdog/heartbeat code.
     _LOGGER.info(
@@ -816,6 +888,17 @@ def process_audio(state: ServerState, mic, block_size: int):
                         except Exception:
                             _LOGGER.exception("MicCapture.feed raised")
 
+                    # Stage C — feed the wake-capture ring buffer. Independent
+                    # of MicCapture: WakeCapture always tracks the 3s window
+                    # leading up to a wake fire, while MicCapture only buffers
+                    # the post-wake utterance. O(1) per chunk; safe no-op
+                    # when wake_capture isn't wired.
+                    if state.wake_capture is not None:
+                        try:
+                            state.wake_capture.feed(audio_chunk)
+                        except Exception:
+                            _LOGGER.exception("WakeCapture.feed raised")
+
                     assert micro_features is not None
                     micro_inputs.clear()
                     micro_inputs.extend(micro_features.process_streaming(audio_chunk))
@@ -827,6 +910,7 @@ def process_audio(state: ServerState, mic, block_size: int):
 
                     for wake_word_index, wake_word in enumerate(wake_words):
                         activated = False
+                        activation_score = 0.0
 
                         # Set dynamic threshold depending on wake word index
                         if wake_word_index == 0:
@@ -850,18 +934,38 @@ def process_audio(state: ServerState, mic, block_size: int):
                                 if wake_word.process_streaming(micro_input):
                                     wake_word.debug_probabilities = True
                                     activated = True
+                                    # MicroWakeWord doesn't expose prob over
+                                    # process_streaming — use threshold as a
+                                    # floor estimate for the sidecar.
+                                    activation_score = max(activation_score, threshold)
                         elif isinstance(wake_word, OpenWakeWord):
                             for oww_input in oww_inputs:
                                 for prob in wake_word.process_streaming(oww_input):
                                     if prob > threshold:
                                         _LOGGER.debug("Wake word '%s' activated (probability %.3f exceeded threshold %.3f)", wake_word.wake_word, prob, threshold)  # type: ignore[attr-defined]
                                         activated = True
+                                        if prob > activation_score:
+                                            activation_score = float(prob)
 
                         if activated and not state.muted:
                             # Check refractory
                             now = time.monotonic()
                             if (last_active is None) or ((now - last_active) > state.refractory_seconds):
-                                state.satellite.wakeup(wake_word)
+                                # Stage C — capture the 3s window for the
+                                # retraining dataset before wakeup() runs, so
+                                # the WAV's audio matches the wake-fire moment.
+                                wake_id = None
+                                if state.wake_capture is not None:
+                                    try:
+                                        wake_id = state.wake_capture.on_wake_fire(
+                                            score=activation_score,
+                                            peak_score=activation_score,
+                                            model=getattr(wake_word, "wake_word", None),
+                                            sensitivity=threshold,
+                                        )
+                                    except Exception:
+                                        _LOGGER.exception("WakeCapture.on_wake_fire raised")
+                                state.satellite.wakeup(wake_word, wake_id=wake_id)
                                 last_active = now
 
                     # Always process to keep state correct
