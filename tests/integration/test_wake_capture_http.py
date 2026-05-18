@@ -96,6 +96,15 @@ def _post(url: str, body: dict, timeout: float = 2.0) -> tuple[int, bytes]:
         return e.code, e.read()
 
 
+def _delete(url: str, timeout: float = 2.0) -> tuple[int, bytes]:
+    req = urllib.request.Request(url, method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
 def test_healthz_returns_ok(http_server):
     base, _, *_ = http_server
     status, body, _ = _get(base + "/healthz")
@@ -191,6 +200,30 @@ def test_label_endpoint_400s_on_invalid_body(http_server):
             status = resp.status
     except urllib.error.HTTPError as e:
         status = e.code
+    assert status == 400
+
+
+def test_delete_endpoint_round_trip(http_server):
+    base, wc, a, *_ = http_server
+    assert (wc.capture_dir / f"{a}.wav").exists()
+    status, body = _delete(f"{base}/wake_captures/{a}")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["ok"] is True
+    assert payload["wake_id_str"] == a
+    assert not (wc.capture_dir / f"{a}.wav").exists()
+    assert not (wc.capture_dir / f"{a}.wav.json").exists()
+
+
+def test_delete_endpoint_404s_on_unknown_wake_id(http_server):
+    base, *_ = http_server
+    status, _ = _delete(f"{base}/wake_captures/20260518T120000_000000_ffffff")
+    assert status == 404
+
+
+def test_delete_endpoint_400s_on_bad_chars(http_server):
+    base, *_ = http_server
+    status, _ = _delete(f"{base}/wake_captures/has..dots")
     assert status == 400
 
 

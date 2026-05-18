@@ -22,6 +22,8 @@ import uuid
 from enum import Enum
 from typing import TYPE_CHECKING, Optional, Union
 
+from .bridge_client import StaleGeneration
+
 if TYPE_CHECKING:
     from .ha_bridge import HABridge
     from .mic_capture import SpeechBuffer
@@ -316,6 +318,22 @@ class DeviceSession:
                 text=asr_result.text,
                 asr_confidence=asr_result.confidence,
             )
+        except StaleGeneration as exc:
+            # 409: bridge says our gen is behind. L.5 says drop silently —
+            # but we still need to release this wake's state and unduck so
+            # the next wake works. We do NOT publish a K.3 cancel for this:
+            # nothing the user did caused it, and BRIDGE_TIMEOUT would
+            # mis-label the sidecar.
+            _LOGGER.warning("Bridge /chat stale_generation: %s", exc)
+            if self.gen_check(captured_gen):
+                self.transition_to(State.IDLE, reason="stale_generation")
+                sat = getattr(self.state, "satellite", None)
+                if sat is not None:
+                    try:
+                        sat.unduck()
+                    except Exception:
+                        pass
+            return
         except Exception as exc:
             _LOGGER.warning("Bridge /chat failed: %s", exc)
             if self.gen_check(captured_gen):

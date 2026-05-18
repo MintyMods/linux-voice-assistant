@@ -326,6 +326,34 @@ def test_manual_label_rejects_unknown_label(capture_dir, clock):
     assert wc.manual_label(wid, "great", user="rob") is False
 
 
+def test_delete_capture_removes_wav_and_sidecar(capture_dir, clock):
+    wc = _make_wc(capture_dir, clock)
+    wc.feed(_silence_chunk(1000))
+    wid = wc.on_wake_fire(score=0.7)
+    assert (capture_dir / f"{wid}.wav").exists()
+    assert (capture_dir / f"{wid}.wav.json").exists()
+    assert wc.delete_capture(wid) is True
+    assert not (capture_dir / f"{wid}.wav").exists()
+    assert not (capture_dir / f"{wid}.wav.json").exists()
+
+
+def test_delete_capture_unknown_wake_id_is_false(capture_dir, clock):
+    wc = _make_wc(capture_dir, clock)
+    assert wc.delete_capture("20260518T120000_000000_deadbe") is False
+
+
+def test_delete_capture_cleans_pending_dicts(capture_dir, clock):
+    wc = _make_wc(capture_dir, clock)
+    wc.feed(_silence_chunk(1000))
+    wid = wc.on_wake_fire(score=0.7)
+    wc.bind_session(wid, "sess-DEL", 5)
+    assert "sess-DEL" in wc._session_to_wake
+    assert wid in wc._pending
+    assert wc.delete_capture(wid) is True
+    assert "sess-DEL" not in wc._session_to_wake
+    assert wid not in wc._pending
+
+
 def test_list_captures_filters_to_triage_bucket_by_default(capture_dir, clock):
     wc = _make_wc(capture_dir, clock)
     wc.feed(_silence_chunk(1000))
@@ -477,3 +505,100 @@ def test_bind_session_after_write_still_patches(capture_dir, clock):
         data = json.load(f)
     assert data["session_id"] == "sess-LATE"
     assert data["generation"] == 7
+
+
+def test_bind_session_during_write_disk_io_lands_in_sidecar(capture_dir, clock, monkeypatch):
+    """Regression: bind_session cannot slot a stale patch into the window
+    between _write_capture marking ``written=True`` and the sidecar actually
+    being on disk.
+
+    Pre-fix flow that bit production:
+      T0  _write_capture acquired lock, captured sidecar dict with session_id=None,
+          marked written=True, RELEASED lock.
+      T1  bind_session acquired lock, saw written=True, released lock.
+      T2  bind_session called _patch_sidecar — file not on disk yet —
+          FileNotFoundError, silent return.
+      T3  _write_capture wrote sidecar with session_id=None.
+
+    Post-fix: _write_capture holds the lock through the disk write. This test
+    reproduces the race by gating the disk write on a Barrier and verifying
+    bind_session blocks until the write completes.
+    """
+    import threading
+
+    wc = _make_wc(capture_dir, clock)
+    wc.feed(_silence_chunk(1000))
+    wake_id = wc.on_wake_fire(score=0.7)
+
+    # Reset state — on_wake_fire wrote synchronously since no loop is attached.
+    # We need to simulate the executor path: rewind so _write_capture can be
+    # re-invoked with controlled timing.
+    for p in capture_dir.glob("*"):
+        p.unlink()
+    with wc._pending_lock:
+        wc._pending[wake_id] = {
+            "session_id": None,
+            "generation": None,
+            "created_ts": clock(),
+            "sidecar_path": capture_dir / f"{wake_id}.wav.json",
+            "wav_path": capture_dir / f"{wake_id}.wav",
+            "bound_ts": None,
+            "sidecar_template": {
+                "version": 1,
+                "session_id": None,
+                "generation": None,
+                "wake_id_str": wake_id,
+                "label": None,
+            },
+            "written": False,
+        }
+
+    write_started = threading.Event()
+    release_write = threading.Event()
+    original_write_json = wc._write_capture.__globals__["_atomic_write_json"]
+
+    def gated_write_json(path, payload):
+        write_started.set()
+        release_write.wait(timeout=2.0)
+        original_write_json(path, payload)
+
+    monkeypatch.setattr(
+        "linux_voice_assistant.wake_capture._atomic_write_json",
+        gated_write_json,
+    )
+
+    def run_write():
+        wc._write_capture(wake_id, _silence_chunk(100))
+
+    writer = threading.Thread(target=run_write)
+    writer.start()
+    assert write_started.wait(timeout=2.0), "_write_capture never reached disk-write phase"
+
+    # bind_session should block on _pending_lock until the writer releases it.
+    bound_event = threading.Event()
+
+    def run_bind():
+        wc.bind_session(wake_id, "sess-RACE", 42)
+        bound_event.set()
+
+    binder = threading.Thread(target=run_bind)
+    binder.start()
+    # bind must NOT complete while writer holds the lock.
+    assert not bound_event.wait(timeout=0.2), "bind_session ran while _write_capture held the lock"
+
+    # Release the writer; both threads should finish cleanly.
+    release_write.set()
+    writer.join(timeout=2.0)
+    binder.join(timeout=2.0)
+    assert not writer.is_alive()
+    assert not binder.is_alive()
+
+    sidecar_path = capture_dir / f"{wake_id}.wav.json"
+    assert sidecar_path.exists()
+    with open(sidecar_path) as f:
+        data = json.load(f)
+    # Either ordering converges on the bound session_id ending up in the file:
+    # if writer ran first, bind_session patched after; if bind beat the writer
+    # to the lock, the writer's snapshot picked up the bind data.
+    assert data["session_id"] == "sess-RACE"
+    assert data["generation"] == 42

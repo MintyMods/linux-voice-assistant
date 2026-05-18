@@ -5,6 +5,7 @@ Routes
 - ``GET  /wake_captures/list``                      → JSON, paginated, filtered
 - ``GET  /wake_captures/<wake_id_str>.wav``         → WAV bytes
 - ``POST /wake_captures/<wake_id_str>/label``       → JSON `{label, user?}`
+- ``DELETE /wake_captures/<wake_id_str>``           → JSON `{ok, wake_id_str}`
 - ``GET  /wake_captures/stats``                     → JSON `stats_24h()`
 - ``GET  /healthz``                                 → ``"ok"``
 
@@ -146,6 +147,29 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_text(400, "label rejected (unknown wake_id or invalid label)")
             return
         self._send_json(200, {"ok": True, "wake_id_str": wake_id, "label": label})
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        path = parsed.path
+        wc = self.wake_capture
+        if wc is None:
+            self._send_text(503, "wake_capture unavailable")
+            return
+
+        m = re.match(r"^/wake_captures/([^/]+)$", path)
+        if not m:
+            self._send_text(404, "not found")
+            return
+        wake_id = m.group(1)
+        if not _WAKE_ID_RE.match(wake_id):
+            self._send_text(400, "bad wake_id")
+            return
+
+        ok = wc.delete_capture(wake_id)
+        if not ok:
+            self._send_text(404, "wake_id not found")
+            return
+        self._send_json(200, {"ok": True, "wake_id_str": wake_id})
 
 
 class WakeCaptureHTTP:

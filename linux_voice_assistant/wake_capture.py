@@ -66,6 +66,7 @@ TransitionLabelMap = {
     "reply_done": ("positive", "pipeline_complete"),
     "no_speech": ("negative", "no_speech"),
     "empty_reply": ("ambiguous", "empty_reply"),
+    "stale_generation": ("ambiguous", "stale_generation"),
 }
 
 
@@ -272,10 +273,20 @@ class WakeCapture:
         loop.run_in_executor(None, self._write_capture, wake_id_str, pcm_bytes)
 
     def _write_capture(self, wake_id_str: str, pcm_bytes: bytes) -> None:
-        """Materialise WAV + sidecar to disk. Re-reads the pending entry at
-        write time so any bind_session() that landed between on_wake_fire()
-        and the executor's pickup of this job is reflected in the sidecar
-        JSON (advisor-flagged race fix).
+        """Materialise WAV + sidecar to disk. Holds `_pending_lock` through
+        the entire disk write so `bind_session` cannot observe ``written=True``
+        before the file exists. Without that, this race fired in production:
+
+          T0  _write_capture acquires lock, marks written=True, RELEASES lock
+          T1  bind_session acquires lock, sees written=True, releases lock
+          T2  bind_session calls _patch_sidecar — file not on disk yet —
+              FileNotFoundError, silent return
+          T3  _write_capture finally writes the sidecar (session_id=None)
+
+        Result: sidecar permanently missing the bind data. Holding the lock
+        across the ~10ms disk write closes that window. The disk write is
+        small (a few KB) and serialised against the audio thread only via
+        `on_wake_fire`'s brief append, which is fine.
         """
         try:
             with self._pending_lock:
@@ -288,9 +299,9 @@ class WakeCapture:
                 sidecar["generation"] = entry.get("generation")
                 wav_path = entry["wav_path"]
                 sidecar_path = entry["sidecar_path"]
+                _atomic_write_wav(wav_path, pcm_bytes)
+                _atomic_write_json(sidecar_path, sidecar)
                 entry["written"] = True
-            _atomic_write_wav(wav_path, pcm_bytes)
-            _atomic_write_json(sidecar_path, sidecar)
             _LOGGER.debug("Wake capture written: %s (%d bytes)", wake_id_str, len(pcm_bytes))
         except Exception:
             _LOGGER.exception("Wake-capture write failed for %s", wake_id_str)
@@ -369,6 +380,30 @@ class WakeCapture:
             if entry is not None and entry.get("session_id"):
                 self._session_to_wake.pop(entry["session_id"], None)
         return True
+
+    def delete_capture(self, wake_id_str: str) -> bool:
+        """HTTP-endpoint entry: hard-delete WAV + sidecar. Used for triage
+        items the user wants to exclude from training entirely (neither
+        positive nor negative). Idempotent — missing files are not an error.
+        Returns True when at least one of the two files was on disk.
+        """
+        sidecar_path = self.capture_dir / f"{wake_id_str}.wav.json"
+        wav_path = self.capture_dir / f"{wake_id_str}.wav"
+        removed = False
+        for path in (sidecar_path, wav_path):
+            try:
+                path.unlink()
+                removed = True
+            except FileNotFoundError:
+                continue
+            except Exception:
+                _LOGGER.exception("delete_capture: unlink failed for %s", path)
+                return False
+        with self._pending_lock:
+            entry = self._pending.pop(wake_id_str, None)
+            if entry is not None and entry.get("session_id"):
+                self._session_to_wake.pop(entry["session_id"], None)
+        return removed
 
     def _patch_sidecar(self, path: Path, updates: Dict[str, Any]) -> None:
         try:
