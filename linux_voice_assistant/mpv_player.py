@@ -14,13 +14,14 @@ class MpvMediaPlayer:
     delegates all playback logic to LibMpvPlayer.
     """
 
-    def __init__(self, device: str | None = None) -> None:
+    def __init__(self, device: str | None = None, role: str = "media") -> None:
         self._log = logging.getLogger(self.__class__.__name__)
-        self._player = LibMpvPlayer(device=device)
+        self.role = role
+        self._player = LibMpvPlayer(device=device, role=role)
         self._done_callback: Optional[Callable[[], None]] = None
         self._playlist: List[str] = []
 
-        self._log.debug("MpvMediaPlayer initialized (device=%s)", device)
+        self._log.debug("MpvMediaPlayer initialized (device=%s, role=%s)", device, role)
 
     def play(
         self,
@@ -121,17 +122,26 @@ class MpvMediaPlayer:
         self._log.debug("set_volume(volume=%.2f)", volume)
         self._player.set_volume(volume)
 
-    def duck(self, factor: float = 0.5) -> None:
-        """
-        Temporarily reduce volume.
-
-        Args:
-            factor: Volume multiplier (0.0-1.0).
-        """
+    def duck(self, factor: float = 0.3) -> None:
+        """Ramp volume down to `factor` (default 0.3 per G2)."""
         self._log.debug("duck(factor=%.2f)", factor)
         self._player.duck(factor)
 
     def unduck(self) -> None:
-        """Restore volume after ducking."""
+        """Ramp volume back to full over the configured release time."""
         self._log.debug("unduck() called")
         self._player.unduck()
+
+    def configure_duck_envelope(
+        self,
+        *,
+        floor_pct: Optional[int] = None,
+        attack_ms: Optional[int] = None,
+        release_ms: Optional[int] = None,
+    ) -> None:
+        """Propagate G2 live-tunable values to the underlying mpv backend."""
+        self._player.configure_duck_envelope(
+            floor_pct=floor_pct,
+            attack_ms=attack_ms,
+            release_ms=release_ms,
+        )

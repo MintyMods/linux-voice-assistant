@@ -182,6 +182,8 @@ def make_server_state(**overrides: Any) -> Any:
         "stop_word": MagicMock(id="stop_word"),
         "music_player": MagicMock(),
         "tts_player": MagicMock(),
+        "chime_player": MagicMock(),
+        "alarm_player": MagicMock(),
         "wakeup_sound": "",
         "timer_finished_sound": "",
         "processing_sound": "",

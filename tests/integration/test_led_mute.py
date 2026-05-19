@@ -518,19 +518,88 @@ def test_publish_helpers_use_correct_retain_flag(fake_paho):
 
 def test_on_connect_subscribes_to_all_back_compat_topics(fake_paho):
     """Regression: the back-compat control topics must be subscribed
-    on connect — including the new M3 mute/set."""
+    on connect — including M3 mute/set and the E.2 G5 calisto/all/*
+    fleet broadcast mirrors."""
     bridge, fake = _make_bridge(fake_paho)
     subscribed_topics = {t for t, _qos in fake.subscriptions}
     assert subscribed_topics == {
         bridge.led_set_room_topic,
         bridge.led_set_all_topic,
         bridge.volume_set_topic,
+        bridge.volume_set_all_topic,
         bridge.ring_set_topic,
+        bridge.ring_set_all_topic,
         bridge.mute_set_topic,
+        bridge.mute_set_all_topic,
     }
     # All at QoS 1.
     qos_values = {qos for _t, qos in fake.subscriptions}
     assert qos_values == {1}
+
+
+def test_ha_bridge_routes_calisto_all_volume_set(fake_paho, asyncio_loop, writer, mic_gate, monkeypatch):
+    """G5 regression: a fleet-wide volume command must hit the bar just
+    like the per-room equivalent."""
+    bridge, fake = _make_bridge(fake_paho)
+    controller = LedController(
+        loop=asyncio_loop,
+        mic_capture_mute=mic_gate.mute,
+        mic_capture_unmute=mic_gate.unmute,
+        writer=writer,
+    )
+    apply_calls = []
+    monkeypatch.setattr(controller.bar, "apply", lambda p: apply_calls.append(p))
+    bridge.attach_led_controller(controller)
+
+    bridge._on_message(fake, None, _Msg(bridge.volume_set_all_topic, b"75%"))
+
+    assert apply_calls == ["75%"]
+
+
+def test_ha_bridge_routes_calisto_all_mute_set(fake_paho, asyncio_loop, writer, mic_gate, monkeypatch):
+    """G5 regression: a fleet-wide mute=on broadcast mutes every device
+    that hears it (same routing as the per-room topic)."""
+    bridge, fake = _make_bridge(fake_paho)
+    controller = LedController(
+        loop=asyncio_loop,
+        mic_capture_mute=mic_gate.mute,
+        mic_capture_unmute=mic_gate.unmute,
+        writer=writer,
+    )
+    set_private_calls = []
+    monkeypatch.setattr(
+        controller,
+        "set_private",
+        lambda v, source="": set_private_calls.append((v, source)),
+    )
+    bridge.attach_led_controller(controller)
+
+    bridge._on_message(fake, None, _Msg(bridge.mute_set_all_topic, b"on"))
+    bridge._on_message(fake, None, _Msg(bridge.mute_set_all_topic, b"off"))
+
+    assert set_private_calls == [(True, "mqtt"), (False, "mqtt")]
+
+
+def test_ha_bridge_routes_calisto_all_ring_set(fake_paho, asyncio_loop, writer, mic_gate, monkeypatch):
+    """G5 regression: fleet-wide ring/set hits the ring controller."""
+    bridge, fake = _make_bridge(fake_paho)
+    controller = LedController(
+        loop=asyncio_loop,
+        mic_capture_mute=mic_gate.mute,
+        mic_capture_unmute=mic_gate.unmute,
+        writer=writer,
+    )
+    started = []
+    stopped = []
+    monkeypatch.setattr(controller.ring, "start", lambda: started.append(True))
+    monkeypatch.setattr(controller.ring, "stop", lambda: stopped.append(True))
+    bridge.attach_led_controller(controller)
+
+    bridge._on_message(fake, None, _Msg(bridge.ring_set_all_topic, b"on"))
+    bridge._on_message(fake, None, _Msg(bridge.ring_set_all_topic, b"off"))
+
+    assert len(started) == 1
+    assert len(stopped) == 1
 
 
 def test_state_publish_skips_led_mirror_when_controller_attached(

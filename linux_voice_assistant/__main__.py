@@ -320,8 +320,10 @@ async def main() -> None:
         wake_words=wake_models,
         active_wake_words=active_wake_words,
         stop_word=stop_model,
-        music_player=MpvMediaPlayer(device=args.audio_output_device),
-        tts_player=MpvMediaPlayer(device=args.audio_output_device),
+        music_player=MpvMediaPlayer(device=args.audio_output_device, role="media"),
+        tts_player=MpvMediaPlayer(device=args.audio_output_device, role="tts"),
+        chime_player=MpvMediaPlayer(device=args.audio_output_device, role="chime"),
+        alarm_player=MpvMediaPlayer(device=args.audio_output_device, role="alarm"),
         wakeup_sound=args.wakeup_sound,
         timer_finished_sound=args.timer_finished_sound,
         processing_sound=args.processing_sound,
@@ -354,6 +356,19 @@ async def main() -> None:
     initial_volume_percent = int(round(initial_volume * 100))
     state.music_player.set_volume(initial_volume_percent)
     state.tts_player.set_volume(initial_volume_percent)
+    state.chime_player.set_volume(initial_volume_percent)
+    state.alarm_player.set_volume(100.0)
+
+    # Stage E.2 G2 — push ducking envelope onto every channel. Only
+    # music_player ever ducks in practice today, but threading the values
+    # uniformly keeps the live-tunable wire-up trivial when Stage E.2-f
+    # adds chime/tts pre-emption.
+    for _ducker in (state.music_player, state.tts_player, state.chime_player, state.alarm_player):
+        _ducker.configure_duck_envelope(
+            floor_pct=state.duck_floor_pct,
+            attack_ms=state.duck_attack_ms,
+            release_ms=state.duck_release_ms,
+        )
 
     loop = asyncio.get_running_loop()
     max_attempts = 15

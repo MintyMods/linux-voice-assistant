@@ -90,6 +90,8 @@ class ServerState:
     stop_word: "MicroWakeWord"
     music_player: "MpvMediaPlayer"
     tts_player: "MpvMediaPlayer"
+    chime_player: "MpvMediaPlayer"
+    alarm_player: "MpvMediaPlayer"
     wakeup_sound: str
     processing_sound: str
     timer_finished_sound: str
@@ -163,6 +165,12 @@ class ServerState:
     # button + evdev surface.
     audio_control: Any = None
     led_controller: Any = None
+
+    # Stage E.2 — G2 ducking envelope live-tunables. Defaults from M.5 +
+    # G2 decision; HA number entities surface these at runtime (Section N).
+    duck_floor_pct: int = 30
+    duck_attack_ms: int = 150
+    duck_release_ms: int = 300
 
     def save_preferences(self) -> None:
         """Save preferences as JSON."""

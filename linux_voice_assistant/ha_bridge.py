@@ -61,12 +61,18 @@ class HABridge:
         self.led_set_room_topic = f"calisto/{room}/led/set"
         self.led_set_all_topic = "calisto/all/led/set"
         self.volume_set_topic = f"calisto/{room}/volume/set"
+        # Stage E.2 G5 — fleet broadcast mirrors. Any LVA subscribes to its
+        # own room topic AND the corresponding `calisto/all/*` topic so HA
+        # "set all" commands fan out without per-device routing.
+        self.volume_set_all_topic = "calisto/all/volume/set"
         self.ring_set_topic = f"calisto/{room}/ring/set"
+        self.ring_set_all_topic = "calisto/all/ring/set"
         # M3 (Path B) — first-class MQTT mute recovery topic. Lets HA /
         # automations toggle the mute state directly instead of routing
         # through the back-compat `led/set` legacy verbs. Payload is
         # `on` | `off` (also accepts the legacy `mute` | `unmute`).
         self.mute_set_topic = f"calisto/{room}/mute/set"
+        self.mute_set_all_topic = "calisto/all/mute/set"
         # Retained state topics — Lovelace cards + v0 automations read these.
         self.led_state_topic = f"calisto/{room}/led/state"
         self.volume_state_topic = f"calisto/{room}/volume/state"
@@ -164,8 +170,11 @@ class HABridge:
                         (self.led_set_room_topic, 1),
                         (self.led_set_all_topic, 1),
                         (self.volume_set_topic, 1),
+                        (self.volume_set_all_topic, 1),
                         (self.ring_set_topic, 1),
+                        (self.ring_set_all_topic, 1),
                         (self.mute_set_topic, 1),
+                        (self.mute_set_all_topic, 1),
                     ]
                 )
             except Exception:
@@ -292,16 +301,16 @@ def _on_message(self: HABridge, _client: Any, _userdata: Any, msg: Any) -> None:
     try:
         if topic in (self.led_set_room_topic, self.led_set_all_topic):
             controller.apply_legacy(payload)
-        elif topic == self.volume_set_topic:
+        elif topic in (self.volume_set_topic, self.volume_set_all_topic):
             controller.bar.apply(payload)
-        elif topic == self.ring_set_topic:
+        elif topic in (self.ring_set_topic, self.ring_set_all_topic):
             if payload in ("on", "start", "1", "true"):
                 controller.ring.start()
                 self.publish_ring_state(True)
             else:
                 controller.ring.stop()
                 self.publish_ring_state(False)
-        elif topic == self.mute_set_topic:
+        elif topic in (self.mute_set_topic, self.mute_set_all_topic):
             # M3 — first-class mute control. Accepts `on`/`off` (preferred)
             # plus the legacy `mute`/`unmute` verbs for back-compat with
             # automations that historically wrote those values.

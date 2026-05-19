@@ -18,14 +18,25 @@ class LibMpvPlayer(AudioPlayer):
     - volume handling with ducking support
     """
 
-    def __init__(self, device: Optional[str] = None) -> None:
+    def __init__(self, device: Optional[str] = None, role: str = "media") -> None:
         self._log = logging.getLogger(self.__class__.__name__)
+        self.role = role
         self._state: PlayerState = PlayerState.IDLE
         self._state_lock = threading.Lock()
 
         # Volume handling
         self._user_volume: float = 100.0  # 0.0 – 100.0
         self._duck_factor: float = 1.0  # 0.0 – 1.0
+
+        # Stage E.2 G2 — ducking envelope. duck() now ramps linearly from the
+        # current factor to the target over the configured attack ms; unduck()
+        # ramps back to 1.0 over the release ms. A new call cancels any
+        # pending ramp. Bounds match the live tunables in M.5.
+        self._duck_thread: Optional[threading.Thread] = None
+        self._duck_stop: threading.Event = threading.Event()
+        self._duck_attack_ms: int = 150
+        self._duck_release_ms: int = 300
+        self._duck_floor_pct: int = 30  # used to clamp duck() callers passing >floor
 
         # mpv setup
         self._mpv = mpv.MPV(
@@ -51,6 +62,27 @@ class LibMpvPlayer(AudioPlayer):
         # penalty entirely, so back-to-back short sounds (wakeup → TTS, mute →
         # unmute) never lose their first samples regardless of system load.
         self._mpv["audio-stream-silence"] = True
+
+        # Stage E.2 G4 — mpv-native source resilience for the MediaPlayer
+        # channel only. TTS/chime/alarm play local files; reconnect logic is
+        # irrelevant and the larger cache hurts first-audio latency.
+        if role == "media":
+            try:
+                self._mpv["network-timeout"] = 10
+                self._mpv["cache"] = "yes"
+                self._mpv["cache-secs"] = 10
+                self._mpv["stream-lavf-o"] = (
+                    "reconnect=1,"
+                    "reconnect_streamed=1,"
+                    "reconnect_delay_max=30,"
+                    "reconnect_on_network_error=1,"
+                    "reconnect_on_http_error=4xx,5xx"
+                )
+                self._log.debug("Source-resilience options applied (role=media)")
+            except Exception:
+                # Old mpv builds may not accept every option; degrade gracefully
+                # rather than refuse to start.
+                self._log.warning("Failed to apply some source-resilience options", exc_info=True)
 
         # Callback Handling
         self._done_callback: Optional[Callable[[], None]] = None
@@ -126,23 +158,79 @@ class LibMpvPlayer(AudioPlayer):
             self._user_volume = max(0.0, min(100.0, float(volume)))
             self._apply_volume()
 
-    def duck(self, factor: float = 0.5) -> None:
-        """
-        Reduce volume temporarily by a ducking factor.
-
-        Args:
-            factor: Ducking factor (0.0–1.0).
-        """
-        self._log.debug("unduck() called")
-        with self._state_lock:
-            self._duck_factor = max(0.0, min(1.0, float(factor)))
-            self._apply_volume()
+    def duck(self, factor: float = 0.3) -> None:
+        """Ramp volume down to `factor` over `_duck_attack_ms` (G2)."""
+        target = max(0.0, min(1.0, float(factor)))
+        self._log.debug("duck(target=%.2f, attack=%dms)", target, self._duck_attack_ms)
+        self._start_ramp(target, self._duck_attack_ms)
 
     def unduck(self) -> None:
-        """Restore volume to the user-defined level."""
-        self._log.debug("unduck() called")
+        """Ramp volume back to 1.0 over `_duck_release_ms` (G2)."""
+        self._log.debug("unduck(release=%dms)", self._duck_release_ms)
+        self._start_ramp(1.0, self._duck_release_ms)
+
+    def configure_duck_envelope(
+        self,
+        *,
+        floor_pct: Optional[int] = None,
+        attack_ms: Optional[int] = None,
+        release_ms: Optional[int] = None,
+    ) -> None:
+        """Update the live-tunable envelope params (G2 number entities)."""
+        if floor_pct is not None:
+            self._duck_floor_pct = max(0, min(100, int(floor_pct)))
+        if attack_ms is not None:
+            self._duck_attack_ms = max(0, int(attack_ms))
+        if release_ms is not None:
+            self._duck_release_ms = max(0, int(release_ms))
+
+    def _start_ramp(self, target: float, duration_ms: int) -> None:
+        """Cancel any in-flight ramp; start a new one toward `target`."""
+        self._cancel_ramp()
+        if duration_ms <= 0:
+            with self._state_lock:
+                self._duck_factor = target
+                self._apply_volume()
+            return
+
         with self._state_lock:
-            self._duck_factor = 1.0
+            start = self._duck_factor
+
+        stop = threading.Event()
+        self._duck_stop = stop
+        thread = threading.Thread(
+            target=self._ramp_run,
+            args=(start, target, duration_ms, stop),
+            name=f"mpv-duck-ramp-{self.role}",
+            daemon=True,
+        )
+        self._duck_thread = thread
+        thread.start()
+
+    def _cancel_ramp(self) -> None:
+        prev_stop = self._duck_stop
+        prev_thread = self._duck_thread
+        if prev_thread is not None and prev_thread.is_alive():
+            prev_stop.set()
+
+    def _ramp_run(self, start: float, target: float, duration_ms: int, stop: threading.Event) -> None:
+        # 50 Hz update rate — smooth enough at the timescales we use
+        # (150–1000 ms) and cheap enough that overlap with mpv's audio
+        # thread is harmless.
+        step_ms = 20
+        steps = max(1, duration_ms // step_ms)
+        delta = (target - start) / steps
+        for i in range(1, steps + 1):
+            if stop.wait(step_ms / 1000.0):
+                # Pre-empted by another duck/unduck call. Leave the volume
+                # wherever the new ramp will pick it up from.
+                return
+            with self._state_lock:
+                self._duck_factor = start + delta * i
+                self._apply_volume()
+        # Snap to exact target on final step to avoid float drift.
+        with self._state_lock:
+            self._duck_factor = target
             self._apply_volume()
 
     # -------- Internal helpers --------
