@@ -62,6 +62,11 @@ class HABridge:
         self.led_set_all_topic = "calisto/all/led/set"
         self.volume_set_topic = f"calisto/{room}/volume/set"
         self.ring_set_topic = f"calisto/{room}/ring/set"
+        # M3 (Path B) — first-class MQTT mute recovery topic. Lets HA /
+        # automations toggle the mute state directly instead of routing
+        # through the back-compat `led/set` legacy verbs. Payload is
+        # `on` | `off` (also accepts the legacy `mute` | `unmute`).
+        self.mute_set_topic = f"calisto/{room}/mute/set"
         # Retained state topics — Lovelace cards + v0 automations read these.
         self.led_state_topic = f"calisto/{room}/led/state"
         self.volume_state_topic = f"calisto/{room}/volume/state"
@@ -160,6 +165,7 @@ class HABridge:
                         (self.led_set_all_topic, 1),
                         (self.volume_set_topic, 1),
                         (self.ring_set_topic, 1),
+                        (self.mute_set_topic, 1),
                     ]
                 )
             except Exception:
@@ -271,6 +277,7 @@ def _on_message(self: HABridge, _client: Any, _userdata: Any, msg: Any) -> None:
         calisto/all/led/set         → controller.apply_legacy(payload)
         calisto/<room>/volume/set   → controller.bar.apply(payload)
         calisto/<room>/ring/set     → controller.ring.start() / .stop()
+        calisto/<room>/mute/set     → controller.set_private(payload, source="mqtt")
     """
     controller = self._led_controller
     if controller is None:
@@ -294,6 +301,19 @@ def _on_message(self: HABridge, _client: Any, _userdata: Any, msg: Any) -> None:
             else:
                 controller.ring.stop()
                 self.publish_ring_state(False)
+        elif topic == self.mute_set_topic:
+            # M3 — first-class mute control. Accepts `on`/`off` (preferred)
+            # plus the legacy `mute`/`unmute` verbs for back-compat with
+            # automations that historically wrote those values.
+            if payload in ("on", "mute", "1", "true"):
+                controller.set_private(True, source="mqtt")
+            elif payload in ("off", "unmute", "0", "false"):
+                controller.set_private(False, source="mqtt")
+            else:
+                _LOGGER.warning(
+                    "HABridge: mute/set unknown payload %r — expected on|off",
+                    payload,
+                )
     except Exception:
         _LOGGER.exception("HABridge: routing %s = %r raised", topic, payload)
 

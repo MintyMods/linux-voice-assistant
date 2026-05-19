@@ -233,3 +233,84 @@ def test_idempotent_start_capture():
         assert mc._start_ts == first_ts
     finally:
         loop.close()
+
+
+# ---- Path B mute / unmute --------------------------------------------------
+
+
+def test_mute_drops_all_feed_chunks_and_clears_ring():
+    """While muted, feed() must not update the pre-roll ring or progress
+    any active capture. Pre-roll ring is cleared on entry to muted state
+    so post-unmute does not leak pre-mute audio."""
+    loop = asyncio.new_event_loop()
+    try:
+        emitted: List[SpeechBuffer] = []
+        mc = MicCapture(loop=loop, on_speech_captured=lambda b: emitted.append(b))
+        # Fill the ring with some audio first.
+        mc.feed(_speech(500))
+        assert len(mc._ring) > 0
+        # Mute clears the ring.
+        mc.mute()
+        assert mc.is_muted is True
+        assert len(mc._ring) == 0
+        # Subsequent feeds drop silently.
+        mc.feed(_speech(500))
+        assert len(mc._ring) == 0
+        # No capture should be in flight; no callback should fire.
+        loop.run_until_complete(asyncio.sleep(0))
+        assert emitted == []
+    finally:
+        loop.close()
+
+
+def test_mute_aborts_inflight_capture():
+    """If a capture is active when mute() is called, it must be aborted
+    so a half-recorded utterance can't surface to ASR after unmute."""
+    loop = asyncio.new_event_loop()
+    try:
+        emitted: List[SpeechBuffer] = []
+        mc = MicCapture(loop=loop, on_speech_captured=lambda b: emitted.append(b))
+        mc.start_capture()
+        mc.feed(_speech(200))
+        assert mc._active is True
+        mc.mute()
+        assert mc._active is False
+        # Subsequent silence does not flush a buffer (capture was aborted).
+        mc.feed(_silence(SILENCE_END_MS + 100))
+        loop.run_until_complete(asyncio.sleep(0))
+        loop.run_until_complete(asyncio.sleep(0))
+        assert emitted == []
+    finally:
+        loop.close()
+
+
+def test_unmute_resumes_ring_maintenance():
+    """After unmute(), feed() must once again fill the pre-roll ring."""
+    loop = asyncio.new_event_loop()
+    try:
+        emitted: List[SpeechBuffer] = []
+        mc = MicCapture(loop=loop, on_speech_captured=lambda b: emitted.append(b))
+        mc.mute()
+        mc.feed(_speech(500))
+        assert len(mc._ring) == 0
+        mc.unmute()
+        assert mc.is_muted is False
+        mc.feed(_speech(500))
+        assert len(mc._ring) > 0
+    finally:
+        loop.close()
+
+
+def test_mute_unmute_idempotent():
+    """Calling mute() twice or unmute() twice should be a no-op the second time."""
+    loop = asyncio.new_event_loop()
+    try:
+        mc = MicCapture(loop=loop, on_speech_captured=lambda _b: None)
+        mc.mute()
+        mc.mute()  # no-op
+        assert mc.is_muted is True
+        mc.unmute()
+        mc.unmute()  # no-op
+        assert mc.is_muted is False
+    finally:
+        loop.close()

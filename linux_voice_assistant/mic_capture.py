@@ -153,6 +153,12 @@ class MicCapture:
         self._silent_run_ms = 0.0
         self._vad_prob_sum = 0.0
         self._vad_prob_count = 0
+        # Path B mute gate. While True: feed() drops every chunk silently —
+        # no ring update, no VAD, no capture. The upstream `process_audio`
+        # thread keeps the USB Audio Class claim open (so the hardware mute
+        # button keeps emitting KEY_MICMUTE on evdev), but no audio reaches
+        # wake-word / VAD / ASR until unmute().
+        self._muted = False
 
         # Fail loud on construction if TEN-VAD can't load. With require_vad=False
         # callers opt into the silence-only degraded path (tests use this).
@@ -185,10 +191,17 @@ class MicCapture:
 
         If a capture is active, also routes the chunk through VAD and the
         speech buffer, with end-of-speech / 30 s cap detection.
+
+        While muted (Path B), the chunk is dropped silently — no ring
+        update, no VAD, no capture progression. The pre-roll ring is
+        cleared on entry to muted state so post-unmute pre-roll does not
+        leak audio captured before the mute.
         """
         if not chunk:
             return
         with self._lock:
+            if self._muted:
+                return
             # Always maintain the pre-roll ring.
             self._ring.extend(chunk)
             overflow = len(self._ring) - self._ring_max
@@ -309,6 +322,35 @@ class MicCapture:
             self._aborted = True
             self._capture_buf = bytearray()
             self._vad_carry = bytearray()
+
+    def mute(self) -> None:
+        """Path B frame-gate ON. Drops every subsequent feed() chunk,
+        clears the pre-roll ring, and aborts any in-flight capture so a
+        half-recorded utterance can't surface to ASR after unmute. The
+        USB Audio Class claim held by `process_audio` is NOT touched —
+        hardware mute button + wake-word listener stay alive."""
+        with self._lock:
+            if self._muted:
+                return
+            self._muted = True
+            self._ring = bytearray()
+            if self._active:
+                self._active = False
+                self._aborted = True
+                self._capture_buf = bytearray()
+                self._vad_carry = bytearray()
+
+    def unmute(self) -> None:
+        """Path B frame-gate OFF. Resumes ring-buffer maintenance and
+        normal capture progression on subsequent feed() calls. Does not
+        replay any frames captured while muted (they were dropped)."""
+        with self._lock:
+            self._muted = False
+
+    @property
+    def is_muted(self) -> bool:
+        with self._lock:
+            return self._muted
 
     # ---- internal: finish + dispatch -------------------------------------
 

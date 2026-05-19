@@ -4,27 +4,33 @@ Covers the absorbed subsystem end-to-end without touching real hardware:
 
   * `FakeHidWriter` replaces `linux_voice_assistant.led.hid.HidWriter` —
     records every byte sequence + write_one in order.
-  * A daemon "recorder simulator" drives `AudioControl` like the real
-    `process_audio` loop: polls `is_pause_desired`, confirms paused on
-    request, waits for resume, confirms resumed.
+  * Path B mute uses two injected callables (`mic_capture_mute` /
+    `mic_capture_unmute`) to gate `MicCapture`'s frame flow. The tests
+    use simple counter callables — the audio claim is NOT touched, so
+    there's no recorder simulator needed any more.
   * `HABridge` is wired with the `fake_paho` factory from
     `tests/conftest.py` so the MQTT subscribe/publish path runs without
     a real broker.
 
-Scope per Stage E.1 plan §12:
-  1. `enter_private` performs the full Path A handshake (pause →
-     settle → wake seq → 09 01) in the right order.
-  2. `exit_private` runs the canonical end-call sequence then resumes.
+Scope per Stage E.1 plan §12 (post Path-B pivot 2026-05-18):
+  1. `enter_private` paints the cosmetic red palette + invokes the
+     MicCapture mute gate.
+  2. `exit_private` clears the cosmetic palette + invokes the unmute
+     gate; LedController re-renders the last K.1 state.
   3. K.1 state transitions render the correct cosmetic palette.
-  4. Muted state suppresses subsequent `on_state` rendering.
-  5. Inbound MQTT (`calisto/<room>/led/set`, `volume/set`, `ring/set`)
-     routes to the right controller method.
-  6. Outbound publishers (`mute/state`, `volume/state`, phone-button)
+  4. Muted state suppresses subsequent `on_state` rendering (M2).
+  5. While muted, `apply_legacy` suppresses non-mute legacy verbs.
+  6. Inbound MQTT routes:
+       calisto/<room>/led/set        → apply_legacy
+       calisto/<room>/volume/set     → bar.apply
+       calisto/<room>/ring/set       → ring.start/.stop
+       calisto/<room>/mute/set       → set_private (M3, new)
+  7. Outbound publishers (`mute/state`, `volume/state`, phone-button)
      fire with the right retain flag.
 
-The recorder simulator and write logs let assertions reach the actual
-sequence the firmware would receive on a real device — see
-`mute_button_probe_results.md` for why these bytes were chosen.
+The write log + gate counters let assertions reach the actual sequence
+the firmware would receive — see `mute_button_probe_results.md` for why
+these bytes were chosen.
 """
 
 from __future__ import annotations
@@ -32,24 +38,16 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import pytest
 
-from linux_voice_assistant.audio_control import AudioControl
 from linux_voice_assistant.ha_bridge import HABridge
 from linux_voice_assistant.led import LedController
-from linux_voice_assistant.led import mute as mute_mod
 from linux_voice_assistant.led.hid import (
-    CALL_STATE_ACTIVE,
-    CALL_STATE_ENDED,
-    CALL_STATE_IN_CALL,
-    REPORT_AUX_INDICATOR,
-    REPORT_CALL_STATE,
     REPORT_HOLD_LED,
     REPORT_MUTE_LED,
     REPORT_OFFHOOK_LED,
-    REPORT_PULSE,
     REPORT_RING_LED,
 )
 from linux_voice_assistant.session import State
@@ -85,47 +83,24 @@ class FakeHidWriter:
             self.flat_writes.clear()
 
 
-class RecorderSimulator:
-    """Models `process_audio`'s pause/resume cooperation."""
+class MicGateRecorder:
+    """Counts mute/unmute callback invocations. Wired into LedController
+    as the `mic_capture_mute` / `mic_capture_unmute` callables."""
 
-    def __init__(self, ac: AudioControl) -> None:
-        self._ac = ac
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        # Track lifecycle for assertions.
-        self.pause_count = 0
-        self.resume_count = 0
+    def __init__(self) -> None:
+        self.mute_count = 0
+        self.unmute_count = 0
 
-    def start(self) -> None:
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+    def mute(self) -> None:
+        self.mute_count += 1
 
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-
-    def _run(self) -> None:
-        while not self._stop.is_set():
-            if self._ac.is_pause_desired():
-                self.pause_count += 1
-                self._ac.confirm_paused()
-                self._ac.wait_for_resume()
-                self.resume_count += 1
-                self._ac.confirm_resumed()
-            time.sleep(0.005)
+    def unmute(self) -> None:
+        self.unmute_count += 1
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def fast_mute(monkeypatch):
-    """Shrink the mute-path sleeps so tests run in ~50ms instead of ~1.2s."""
-    monkeypatch.setattr(mute_mod, "_STREAM_CLOSE_WAIT_S", 0.005)
-    monkeypatch.setattr(mute_mod, "_WAKE_SEQ_SETTLE_S", 0.005)
 
 
 @pytest.fixture
@@ -136,126 +111,93 @@ def asyncio_loop():
 
 
 @pytest.fixture
-def audio_control():
-    return AudioControl()
-
-
-@pytest.fixture
-def recorder(audio_control):
-    sim = RecorderSimulator(audio_control)
-    sim.start()
-    yield sim
-    sim.stop()
-
-
-@pytest.fixture
 def writer():
     return FakeHidWriter()
 
 
 @pytest.fixture
-def controller(asyncio_loop, audio_control, recorder, writer, fast_mute):
+def mic_gate():
+    return MicGateRecorder()
+
+
+@pytest.fixture
+def controller(asyncio_loop, writer, mic_gate):
     """LedController wired with fakes everywhere."""
     return LedController(
         loop=asyncio_loop,
-        audio_control=audio_control,
+        mic_capture_mute=mic_gate.mute,
+        mic_capture_unmute=mic_gate.unmute,
         writer=writer,
     )
 
 
 # ---------------------------------------------------------------------------
-# §12.1  enter_private / exit_private handshake
+# §12.1  Path B mute: enter_private / exit_private
 # ---------------------------------------------------------------------------
 
 
-def test_enter_private_runs_full_path_a_sequence(controller, writer, recorder):
-    """Path A: pause → settle → wake seq groups → 09 01 last."""
+def test_enter_private_paints_cosmetic_red_palette(controller, writer, mic_gate):
+    """Path B enter: `17 01 + 09 01` in that order, MicCapture gated."""
     assert controller.set_private(True, source="test") is True
     assert controller.is_private() is True
-    assert recorder.pause_count == 1
 
-    # The wake sequence is split into three writer.write_seq calls in mute.py.
-    # Extract them after the startup `phone.off()` writes (which use write_one
-    # under the hood and land as individual single-tuple sequences).
-    seqs = [s for s in writer.sequences if any(t[0] in {
-        REPORT_OFFHOOK_LED, REPORT_CALL_STATE, REPORT_PULSE,
-        REPORT_AUX_INDICATOR, REPORT_MUTE_LED,
-    } and len(t) == 2 and t[1] != 0 for t in s)]
-    # Sequence 1: OFFHOOK on + CALL_STATE active + PULSE 1 + PULSE 0
-    # Sequence 2: CALL_STATE in-call + AUX on
-    # Sequence 3: MUTE_LED on (the functional mute)
-    by_first = [s[0] for s in seqs]
-    assert (REPORT_OFFHOOK_LED, 0x01) in by_first or any(
-        t == (REPORT_OFFHOOK_LED, 0x01) for s in seqs for t in s
+    # Path B writes the cosmetic palette in a single write_seq.
+    mute_seqs = [
+        s for s in writer.sequences
+        if (REPORT_OFFHOOK_LED, 0x01) in s and (REPORT_MUTE_LED, 0x01) in s
+    ]
+    assert mute_seqs, f"Expected a sequence with OFFHOOK on + MUTE on; got {writer.sequences}"
+    seq = mute_seqs[0]
+    # Order within the seq matters — OFFHOOK before MUTE (firmware
+    # unlocks the red mute palette only once OFFHOOK is asserted).
+    offhook_idx = seq.index((REPORT_OFFHOOK_LED, 0x01))
+    mute_idx = seq.index((REPORT_MUTE_LED, 0x01))
+    assert offhook_idx < mute_idx, (
+        f"OFFHOOK must precede MUTE in cosmetic enter; got {seq}"
     )
 
-    # The final HID write must be MUTE_LED on — that's what physically mutes
-    # the mic at the firmware level.
-    last_writes = writer.flat_writes[-3:]
-    assert (REPORT_MUTE_LED, 0x01) in last_writes, (
-        f"Expected MUTE_LED=1 in last 3 writes, got {last_writes}"
-    )
-
-    # Wake sequence order check: OFFHOOK 0x01 must precede CALL_STATE ACTIVE
-    # which must precede CALL_STATE IN_CALL which must precede MUTE_LED 0x01.
-    order = []
-    for w in writer.flat_writes:
-        if w == (REPORT_OFFHOOK_LED, 0x01):
-            order.append("offhook_on")
-        elif w == (REPORT_CALL_STATE, CALL_STATE_ACTIVE):
-            order.append("call_active")
-        elif w == (REPORT_CALL_STATE, CALL_STATE_IN_CALL):
-            order.append("call_in")
-        elif w == (REPORT_AUX_INDICATOR, 0x01):
-            order.append("aux_on")
-        elif w == (REPORT_MUTE_LED, 0x01):
-            order.append("mute_on")
-    assert order == ["offhook_on", "call_active", "call_in", "aux_on", "mute_on"], (
-        f"Wake-sequence order wrong: {order}"
-    )
+    # MicCapture frame-gate fired once.
+    assert mic_gate.mute_count == 1
+    assert mic_gate.unmute_count == 0
 
 
-def test_exit_private_runs_end_call_then_resumes(controller, writer, recorder):
-    # Enter, then clear writer log to focus on exit.
+def test_exit_private_clears_cosmetic_palette(controller, writer, mic_gate):
+    """Path B exit: `09 00 + 17 00`, MicCapture ungated."""
     controller.set_private(True, source="test")
-    assert recorder.pause_count == 1
+    assert mic_gate.mute_count == 1
     writer.reset()
 
     assert controller.set_private(False, source="test") is True
     assert controller.is_private() is False
-    assert recorder.resume_count == 1
 
-    # End-call sequence — order matters: AUX off → CALL_STATE_ENDED →
-    # MUTE_LED off → OFFHOOK off → HOLD off, all before resume.
-    seq = writer.sequences[0]  # mute.exit_private writes one big sequence
+    # First written sequence after reset should be the cosmetic clear.
+    seq = writer.sequences[0]
     assert seq == [
-        (REPORT_AUX_INDICATOR, 0x00),
-        (REPORT_CALL_STATE, CALL_STATE_ENDED),
         (REPORT_MUTE_LED, 0x00),
         (REPORT_OFFHOOK_LED, 0x00),
-        (REPORT_HOLD_LED, 0x00),
-    ]
+    ], f"Cosmetic exit must clear MUTE then OFFHOOK; got {seq}"
+
+    assert mic_gate.unmute_count == 1
 
 
-def test_pause_timeout_converges_to_unmuted(asyncio_loop, audio_control, writer, fast_mute):
-    """If the recorder never confirms pause, LedMute must converge to
-    unmuted (clear LEDs + try to force resume) and return False."""
-    # No RecorderSimulator — audio_control will never see confirm_paused.
-    controller = LedController(
-        loop=asyncio_loop,
-        audio_control=audio_control,
-        writer=writer,
-    )
-    # Shrink the LedMute timeout so this test is fast.
-    import linux_voice_assistant.led.mute as mm
-    saved_to = mm._PAUSE_TIMEOUT_S
-    mm._PAUSE_TIMEOUT_S = 0.05
-    try:
-        assert controller.set_private(True, source="test") is False
-    finally:
-        mm._PAUSE_TIMEOUT_S = saved_to
-    # _muted should have been reverted to False.
-    assert controller.is_private() is False
+def test_enter_private_audio_claim_not_touched(controller, writer, mic_gate):
+    """Path B regression: NO telephony-page writes (`0x0A/0x0E/0x46`) —
+    those would only land in firmware after an audio-claim release, and
+    Path B keeps the claim open. The mute gate is the load-bearing piece."""
+    controller.set_private(True, source="test")
+    # No CALL_STATE writes anywhere in the mute path.
+    for seq in writer.sequences:
+        for report_id, _value in seq:
+            assert report_id not in (0x0A, 0x0E, 0x46), (
+                f"Path B must not write telephony page; got {seq}"
+            )
+
+
+def test_set_private_idempotent(controller, mic_gate):
+    """Calling set_private(True) twice should only fire one gate event."""
+    controller.set_private(True, source="test")
+    controller.set_private(True, source="test")
+    assert mic_gate.mute_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -295,16 +237,39 @@ def test_on_state_on_degraded_writes_hold_led(controller, writer):
     assert (REPORT_HOLD_LED, 1) in writer.flat_writes
 
 
-def test_muted_suppresses_on_state_rendering(controller, writer, recorder):
+def test_muted_suppresses_on_state_rendering(controller, writer):
+    """M2: while muted, on_state must not paint state-palette LEDs —
+    the mute overlay is the visual source of truth."""
     controller.set_private(True, source="test")
     writer.reset()
-    # While muted, on_state(WAKING) should not paint cosmetic OFFHOOK pulse.
     controller.on_state(State.WAKING)
     time.sleep(0.05)
     assert (REPORT_OFFHOOK_LED, 1) not in writer.flat_writes
 
 
-def test_unmute_replays_last_state(controller, writer, recorder):
+def test_muted_suppresses_apply_legacy_non_mute_verbs(controller, writer):
+    """M2: while muted, legacy verbs other than mute/unmute must be
+    suppressed — they would overwrite the red overlay."""
+    controller.set_private(True, source="test")
+    writer.reset()
+    controller.apply_legacy("wake")
+    controller.apply_legacy("processing")
+    time.sleep(0.05)
+    assert (REPORT_OFFHOOK_LED, 1) not in writer.flat_writes
+    assert (REPORT_RING_LED, 1) not in writer.flat_writes
+
+
+def test_apply_legacy_unmute_still_routes_while_muted(controller, mic_gate):
+    """The mute-overlay guard must NOT block `unmute` — otherwise an
+    HA recovery script (`led/set unmute`) could not escape."""
+    controller.set_private(True, source="test")
+    assert controller.is_private() is True
+    controller.apply_legacy("unmute")
+    assert controller.is_private() is False
+    assert mic_gate.unmute_count == 1
+
+
+def test_unmute_replays_last_state(controller, writer):
     """Going private then back should re-render the K.1 state we were in."""
     controller.on_state(State.THINKING)
     controller.set_private(True, source="test")
@@ -342,12 +307,13 @@ def test_soft_cancel_is_silent(controller, writer):
 # ---------------------------------------------------------------------------
 
 
-def test_phone_short_press_routes_to_red_button_soft(asyncio_loop, audio_control, recorder, writer, fast_mute):
+def test_phone_short_press_routes_to_red_button_soft(asyncio_loop, writer, mic_gate):
     cancels: List[str] = []
     actions: List[str] = []
     controller = LedController(
         loop=asyncio_loop,
-        audio_control=audio_control,
+        mic_capture_mute=mic_gate.mute,
+        mic_capture_unmute=mic_gate.unmute,
         writer=writer,
         on_phone_cancel=lambda r: cancels.append(r),
         on_phone_button=lambda a: actions.append(a),
@@ -364,7 +330,13 @@ def test_phone_short_press_routes_to_red_button_soft(asyncio_loop, audio_control
 # ---------------------------------------------------------------------------
 
 
-def test_ha_bridge_routes_led_set_to_apply_legacy(fake_paho, asyncio_loop, audio_control, recorder, writer, fast_mute):
+class _Msg:
+    def __init__(self, topic: str, payload: bytes) -> None:
+        self.topic = topic
+        self.payload = payload
+
+
+def _make_bridge(fake_paho):
     created, factory = fake_paho
     bridge = HABridge(
         room="lounge",
@@ -373,20 +345,19 @@ def test_ha_bridge_routes_led_set_to_apply_legacy(fake_paho, asyncio_loop, audio
         client_factory=factory,
     )
     bridge.start()
-    fake = created[0]
+    return bridge, created[0]
+
+
+def test_ha_bridge_routes_led_set_to_apply_legacy(fake_paho, asyncio_loop, writer, mic_gate):
+    bridge, fake = _make_bridge(fake_paho)
     assert fake.connect_args == ("127.0.0.1", 1883, 60)
-    # Subscribe call recorded via the on_connect path — but FakeMqttClient
-    # doesn't implement subscribe(), so we just verify routing works by
-    # invoking _on_message directly.
     controller = LedController(
-        loop=asyncio_loop, audio_control=audio_control, writer=writer
+        loop=asyncio_loop,
+        mic_capture_mute=mic_gate.mute,
+        mic_capture_unmute=mic_gate.unmute,
+        writer=writer,
     )
     bridge.attach_led_controller(controller)
-
-    class _Msg:
-        def __init__(self, topic, payload):
-            self.topic = topic
-            self.payload = payload
 
     writer.reset()
     bridge._on_message(fake, None, _Msg(bridge.led_set_room_topic, b"processing"))
@@ -395,44 +366,33 @@ def test_ha_bridge_routes_led_set_to_apply_legacy(fake_paho, asyncio_loop, audio
     assert (REPORT_OFFHOOK_LED, 0) in writer.flat_writes
 
 
-def test_ha_bridge_routes_volume_set_to_bar(fake_paho, asyncio_loop, audio_control, recorder, writer, fast_mute, monkeypatch):
-    created, factory = fake_paho
-    bridge = HABridge(room="lounge", host="127.0.0.1", port=1883, client_factory=factory)
-    bridge.start()
-    fake = created[0]
+def test_ha_bridge_routes_volume_set_to_bar(fake_paho, asyncio_loop, writer, mic_gate, monkeypatch):
+    bridge, fake = _make_bridge(fake_paho)
     controller = LedController(
-        loop=asyncio_loop, audio_control=audio_control, writer=writer
+        loop=asyncio_loop,
+        mic_capture_mute=mic_gate.mute,
+        mic_capture_unmute=mic_gate.unmute,
+        writer=writer,
     )
     bridge.attach_led_controller(controller)
 
-    # Mock LedBar.apply so we don't shell out to amixer.
     applied: List[str] = []
     monkeypatch.setattr(controller.bar, "apply", lambda payload: applied.append(payload) or True)
-
-    class _Msg:
-        def __init__(self, topic, payload):
-            self.topic = topic
-            self.payload = payload
 
     bridge._on_message(fake, None, _Msg(bridge.volume_set_topic, b"up"))
     bridge._on_message(fake, None, _Msg(bridge.volume_set_topic, b"50%"))
     assert applied == ["up", "50%"]
 
 
-def test_ha_bridge_routes_ring_set(fake_paho, asyncio_loop, audio_control, recorder, writer, fast_mute):
-    created, factory = fake_paho
-    bridge = HABridge(room="lounge", host="127.0.0.1", port=1883, client_factory=factory)
-    bridge.start()
-    fake = created[0]
+def test_ha_bridge_routes_ring_set(fake_paho, asyncio_loop, writer, mic_gate):
+    bridge, fake = _make_bridge(fake_paho)
     controller = LedController(
-        loop=asyncio_loop, audio_control=audio_control, writer=writer
+        loop=asyncio_loop,
+        mic_capture_mute=mic_gate.mute,
+        mic_capture_unmute=mic_gate.unmute,
+        writer=writer,
     )
     bridge.attach_led_controller(controller)
-
-    class _Msg:
-        def __init__(self, topic, payload):
-            self.topic = topic
-            self.payload = payload
 
     writer.reset()
     bridge._on_message(fake, None, _Msg(bridge.ring_set_topic, b"on"))
@@ -445,16 +405,95 @@ def test_ha_bridge_routes_ring_set(fake_paho, asyncio_loop, audio_control, recor
     assert bridge.ring_state_topic in topics
 
 
+def test_ha_bridge_routes_mute_set_on(fake_paho, asyncio_loop, writer, mic_gate):
+    """M3: calisto/<room>/mute/set = 'on' → controller.set_private(True)."""
+    bridge, fake = _make_bridge(fake_paho)
+    controller = LedController(
+        loop=asyncio_loop,
+        mic_capture_mute=mic_gate.mute,
+        mic_capture_unmute=mic_gate.unmute,
+        writer=writer,
+    )
+    bridge.attach_led_controller(controller)
+
+    bridge._on_message(fake, None, _Msg(bridge.mute_set_topic, b"on"))
+    assert controller.is_private() is True
+    assert mic_gate.mute_count == 1
+
+
+def test_ha_bridge_routes_mute_set_off(fake_paho, asyncio_loop, writer, mic_gate):
+    """M3: calisto/<room>/mute/set = 'off' → controller.set_private(False)."""
+    bridge, fake = _make_bridge(fake_paho)
+    controller = LedController(
+        loop=asyncio_loop,
+        mic_capture_mute=mic_gate.mute,
+        mic_capture_unmute=mic_gate.unmute,
+        writer=writer,
+    )
+    bridge.attach_led_controller(controller)
+
+    controller.set_private(True, source="test")
+    bridge._on_message(fake, None, _Msg(bridge.mute_set_topic, b"off"))
+    assert controller.is_private() is False
+    assert mic_gate.unmute_count == 1
+
+
+def test_hidraw_mute_press_toggles_set_private(asyncio_loop, writer, mic_gate):
+    """When the firmware reports a hardware mute-button press on hidraw
+    0x0B 0x01, LedController must toggle the private state. Each
+    physical press is a single momentary event (press/release pair
+    filtered to press-only by the listener); LVA mirrors firmware's
+    internal toggle by flipping `_muted`."""
+    controller = LedController(
+        loop=asyncio_loop,
+        mic_capture_mute=mic_gate.mute,
+        mic_capture_unmute=mic_gate.unmute,
+        writer=writer,
+    )
+    # First press → muted.
+    controller._dispatch_mute_hidraw_press()
+    asyncio_loop.run_until_complete(asyncio.sleep(0))
+    assert controller.is_private() is True
+    assert mic_gate.mute_count == 1
+
+    # Second press → unmuted.
+    controller._dispatch_mute_hidraw_press()
+    asyncio_loop.run_until_complete(asyncio.sleep(0))
+    assert controller.is_private() is False
+    assert mic_gate.unmute_count == 1
+
+    # Third press → muted again.
+    controller._dispatch_mute_hidraw_press()
+    asyncio_loop.run_until_complete(asyncio.sleep(0))
+    assert controller.is_private() is True
+    assert mic_gate.mute_count == 2
+
+
+def test_ha_bridge_routes_mute_set_legacy_verbs(fake_paho, asyncio_loop, writer, mic_gate):
+    """M3: accept legacy 'mute'/'unmute' verb payloads for back-compat
+    with HA automations that historically used the led/set topic."""
+    bridge, fake = _make_bridge(fake_paho)
+    controller = LedController(
+        loop=asyncio_loop,
+        mic_capture_mute=mic_gate.mute,
+        mic_capture_unmute=mic_gate.unmute,
+        writer=writer,
+    )
+    bridge.attach_led_controller(controller)
+
+    bridge._on_message(fake, None, _Msg(bridge.mute_set_topic, b"mute"))
+    assert controller.is_private() is True
+    bridge._on_message(fake, None, _Msg(bridge.mute_set_topic, b"unmute"))
+    assert controller.is_private() is False
+
+
 # ---------------------------------------------------------------------------
 # §12.6  HABridge publish helpers
 # ---------------------------------------------------------------------------
 
 
 def test_publish_helpers_use_correct_retain_flag(fake_paho):
-    created, factory = fake_paho
-    bridge = HABridge(room="lounge", host="127.0.0.1", port=1883, client_factory=factory)
-    bridge.start()
-    fake = created[0]
+    bridge, fake = _make_bridge(fake_paho)
     fake.publishes.clear()
 
     bridge.publish_volume_state(42)
@@ -473,24 +512,21 @@ def test_publish_helpers_use_correct_retain_flag(fake_paho):
 
 
 # ---------------------------------------------------------------------------
-# Advisor regressions — both caught in the dry-run review pass.
+# Regression coverage
 # ---------------------------------------------------------------------------
 
 
 def test_on_connect_subscribes_to_all_back_compat_topics(fake_paho):
-    """Regression: the four back-compat control topics must be subscribed
-    on connect. Caught when subscribe() was silently AttributeError-ing
-    on FakeMqttClient and the try/except in HABridge swallowed it."""
-    created, factory = fake_paho
-    bridge = HABridge(room="lounge", host="127.0.0.1", port=1883, client_factory=factory)
-    bridge.start()
-    fake = created[0]
+    """Regression: the back-compat control topics must be subscribed
+    on connect — including the new M3 mute/set."""
+    bridge, fake = _make_bridge(fake_paho)
     subscribed_topics = {t for t, _qos in fake.subscriptions}
     assert subscribed_topics == {
         bridge.led_set_room_topic,
         bridge.led_set_all_topic,
         bridge.volume_set_topic,
         bridge.ring_set_topic,
+        bridge.mute_set_topic,
     }
     # All at QoS 1.
     qos_values = {qos for _t, qos in fake.subscriptions}
@@ -498,18 +534,18 @@ def test_on_connect_subscribes_to_all_back_compat_topics(fake_paho):
 
 
 def test_state_publish_skips_led_mirror_when_controller_attached(
-    fake_paho, asyncio_loop, audio_control, recorder, writer, fast_mute
+    fake_paho, asyncio_loop, writer, mic_gate
 ):
     """Regression: with LedController attached, publish_state must NOT
     echo to `calisto/<room>/led/set` — we subscribe to that topic, so
     every K.1 transition would round-trip through `apply_legacy` and
-    re-paint the palette out of order. Caught by advisor review."""
-    created, factory = fake_paho
-    bridge = HABridge(room="lounge", host="127.0.0.1", port=1883, client_factory=factory)
-    bridge.start()
-    fake = created[0]
+    re-paint the palette out of order."""
+    bridge, fake = _make_bridge(fake_paho)
     controller = LedController(
-        loop=asyncio_loop, audio_control=audio_control, writer=writer
+        loop=asyncio_loop,
+        mic_capture_mute=mic_gate.mute,
+        mic_capture_unmute=mic_gate.unmute,
+        writer=writer,
     )
     bridge.attach_led_controller(controller)
     fake.publishes.clear()
@@ -530,10 +566,7 @@ def test_state_publish_still_mirrors_led_when_no_controller(fake_paho):
     """Inverse: with no LedController attached (pre-Stage-E.1 deploys),
     the v0 LED mirror must still fire so external calisto-led.service
     instances keep working."""
-    created, factory = fake_paho
-    bridge = HABridge(room="lounge", host="127.0.0.1", port=1883, client_factory=factory)
-    bridge.start()
-    fake = created[0]
+    bridge, fake = _make_bridge(fake_paho)
     fake.publishes.clear()
 
     bridge.publish_state(state=State.WAKING, generation=1, session_id="sid")
@@ -541,14 +574,21 @@ def test_state_publish_still_mirrors_led_when_no_controller(fake_paho):
     assert bridge.led_topic in topics
 
 
-def test_startup_assertion_clears_full_telephony_state(
-    asyncio_loop, audio_control, recorder, writer, fast_mute
-):
-    """Regression: a mid-mute crash leaves `09 01` + `0A 04 / 0E 01`
-    latched in firmware. Cosmetic-only `phone.off()` doesn't clear those.
-    Startup must run the full end-call sequence."""
+def test_startup_assertion_clears_full_telephony_state(asyncio_loop, writer, mic_gate):
+    """Regression: a mid-mute crash could leave `09 01` + `0A 04 / 0E 01`
+    latched in firmware from a Path A era / external write. Startup
+    runs the full end-call sequence so the device comes up clean."""
+    from linux_voice_assistant.led.hid import (
+        CALL_STATE_ENDED,
+        REPORT_AUX_INDICATOR,
+        REPORT_CALL_STATE,
+    )
+
     controller = LedController(
-        loop=asyncio_loop, audio_control=audio_control, writer=writer
+        loop=asyncio_loop,
+        mic_capture_mute=mic_gate.mute,
+        mic_capture_unmute=mic_gate.unmute,
+        writer=writer,
     )
     writer.reset()
     controller.start()

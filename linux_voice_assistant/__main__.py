@@ -773,16 +773,13 @@ def _start_stage_b_components(state: ServerState, loop: asyncio.AbstractEventLoo
 def _start_stage_e1_led(state: ServerState, loop: asyncio.AbstractEventLoop) -> None:
     """Construct LedController + wire its callbacks into DeviceSession / HABridge.
 
-    AudioControl must already be on `state` (built before
-    `process_audio_thread.start()`). DeviceSession must already be on `state`
-    (built by `_start_stage_b_components`).
+    DeviceSession must already be on `state` (built by
+    `_start_stage_b_components`). Path B no longer requires AudioControl —
+    mute is cosmetic LEDs + MicCapture frame-gate, no audio-claim release.
 
     All callbacks are best-effort: a failure in any one path logs and
     swallows so a malformed dependency doesn't take down the LED surface.
     """
-    if state.audio_control is None:
-        _LOGGER.error("Stage E.1: state.audio_control missing — LED disabled")
-        return
     session = state.device_session
     if session is None:
         _LOGGER.error("Stage E.1: state.device_session missing — LED disabled")
@@ -807,13 +804,21 @@ def _start_stage_e1_led(state: ServerState, loop: asyncio.AbstractEventLoop) -> 
         except Exception:
             _LOGGER.exception("Stage E.1: phone-button publish raised")
 
-    def _mic_capture_abort() -> None:
+    def _mic_capture_mute() -> None:
         mc = state.mic_capture
         if mc is not None:
             try:
-                mc.abort()
+                mc.mute()
             except Exception:
-                _LOGGER.exception("Stage E.1: mic_capture.abort raised")
+                _LOGGER.exception("Stage E.1: mic_capture.mute raised")
+
+    def _mic_capture_unmute() -> None:
+        mc = state.mic_capture
+        if mc is not None:
+            try:
+                mc.unmute()
+            except Exception:
+                _LOGGER.exception("Stage E.1: mic_capture.unmute raised")
 
     def _volume_publish(pct: int) -> None:
         # ha_bridge MQTT publish wired in Stage E.1 step 11. Until that
@@ -830,8 +835,9 @@ def _start_stage_e1_led(state: ServerState, loop: asyncio.AbstractEventLoop) -> 
             _LOGGER.exception("Stage E.1: HABridge.publish_volume_state raised")
 
     def _mute_state_changed(muted: bool) -> None:
-        # Mirror to ServerState.muted for process_audio gating (defence-
-        # in-depth — the audio claim is already released while muted).
+        # Mirror to ServerState.muted so any other audio path consumer
+        # can defend (Path B keeps the USB claim open; MicCapture.feed
+        # is the load-bearing gate).
         state.muted = muted
         bridge = state.ha_bridge
         publish = getattr(bridge, "publish_mute_state", None) if bridge else None
@@ -845,8 +851,8 @@ def _start_stage_e1_led(state: ServerState, loop: asyncio.AbstractEventLoop) -> 
 
     controller = LedController(
         loop=loop,
-        audio_control=state.audio_control,
-        mic_capture_abort=_mic_capture_abort,
+        mic_capture_mute=_mic_capture_mute,
+        mic_capture_unmute=_mic_capture_unmute,
         on_phone_cancel=_phone_cancel,
         on_phone_button=_phone_button,
         on_volume_change=_volume_publish,
@@ -867,8 +873,7 @@ def _start_stage_e1_led(state: ServerState, loop: asyncio.AbstractEventLoop) -> 
         except Exception:
             _LOGGER.exception("Stage E.1: HABridge.attach_led_controller raised")
     _LOGGER.info(
-        "Stage E.1: LedController started (mute=%s, mqtt=%s)",
-        "Path A" if controller.mute else "cosmetic-fallback",
+        "Stage E.1: LedController started (mute=Path B cosmetic + mic-gate, mqtt=%s)",
         "wired" if bridge is not None else "absent",
     )
 

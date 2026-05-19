@@ -73,6 +73,23 @@ _BTN_VOL_UP = 0x02
 _BTN_VOL_DOWN = 0x04
 _BTN_PHONE = 0x80
 
+# Firmware mute-button report (`0x0b 0xNN`). Empirically confirmed
+# 2026-05-18 on the lounge unit: when the hardware mute button is
+# pressed in PC Media mode, the Calisto firmware handles the mute
+# itself (paints LEDs red + clips mic audio + beeps) and emits a
+# press/release PAIR on hidraw 0x0B — `KEY_MICMUTE` on evdev does
+# NOT fire. The hidraw probe captured each physical press as
+# `0x0b 0x01` (press) immediately followed by `0x0b 0x00` (release).
+#
+# Treat `0x0b 0x01` as a single momentary press event (button-click
+# semantics, NOT an absolute state); ignore the release. Each press
+# toggles the LVA mute state. Debounced at 0.5 s to absorb the
+# membrane bounce.
+_MUTE_REPORT_ID = 0x0B
+_MUTE_PRESS = 0x01
+_MUTE_RELEASE = 0x00
+_MUTE_BUTTON_DEBOUNCE_S = 0.5
+
 # >= 500 ms held = "long" press → RED_BUTTON_HARD; < 500 ms = "short" →
 # RED_BUTTON_SOFT. v0 constant; kept verbatim to preserve calibration.
 PHONE_LONG_PRESS_MS = 500
@@ -85,6 +102,11 @@ _RECONNECT_BACKOFF_S = 5.0
 
 PhonePressCallback = Callable[[str], None]
 """Receives `"short"` or `"long"`. Invoked from the listener thread."""
+
+MutePressCallback = Callable[[], None]
+"""Invoked once per debounced hardware-mute-button press, observed via
+the hidraw `0x0B 0x01` report. Caller decides the semantics — typically
+a state toggle. Invoked from the listener thread."""
 
 VolumePressCallback = Callable[[str], None]
 """Receives `"up"` or `"down"`. Invoked from the listener thread."""
@@ -195,12 +217,15 @@ class HidButtonListener:
         *,
         on_phone_press: PhonePressCallback,
         on_volume_press: VolumePressCallback,
+        on_mute_press: Optional[MutePressCallback] = None,
         stop_event: Optional[threading.Event] = None,
     ) -> None:
         self._on_phone_press = on_phone_press
         self._on_volume_press = on_volume_press
+        self._on_mute_press = on_mute_press
         self._stop = stop_event or threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._last_mute_press_at = 0.0
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -267,8 +292,21 @@ class HidButtonListener:
                 return
             if not buf or len(buf) < 2:
                 continue
+            if buf[0] == _MUTE_REPORT_ID:
+                # 0x0b 0x01 = press; 0x0b 0x00 = release. Each physical
+                # press fires both rapidly — only act on the press edge.
+                if self._on_mute_press is None or buf[1] != _MUTE_PRESS:
+                    continue
+                now = time.monotonic()
+                if now - self._last_mute_press_at < _MUTE_BUTTON_DEBOUNCE_S:
+                    _LOGGER.debug("hardware mute button: debounced")
+                    continue
+                self._last_mute_press_at = now
+                _LOGGER.info("hardware mute button pressed (hidraw 0x0B)")
+                self._safe_invoke_nullary(self._on_mute_press)
+                continue
             if buf[0] != _BTN_REPORT_ID:
-                # Other report (e.g. sporadic 0x0B mute edge) — ignore.
+                # Other report (e.g. 0x07 LED state echo) — ignore.
                 continue
             code = buf[1]
             if code == _BTN_PHONE:
@@ -296,6 +334,13 @@ class HidButtonListener:
             cb(arg)
         except Exception:
             _LOGGER.exception("hid listener callback raised")
+
+    @staticmethod
+    def _safe_invoke_nullary(cb: Callable[[], None]) -> None:
+        try:
+            cb()
+        except Exception:
+            _LOGGER.exception("hid listener mute-press callback raised")
 
 
 __all__ = [

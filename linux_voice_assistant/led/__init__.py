@@ -20,7 +20,6 @@ import threading
 import time
 from typing import TYPE_CHECKING, Callable, Optional
 
-from ..audio_control import AudioControl
 from .bar import LedBar
 from .evdev import EvdevMuteListener
 from .hid import (
@@ -86,14 +85,21 @@ class LedController:
     bar/mic/phone LEDs stay red regardless of `on_state` calls. The
     underlying state is still tracked, so on unmute the controller
     re-renders whatever state the session has reached in the meantime.
+
+    Path B (2026-05-18) — `set_private` paints the cosmetic mute palette
+    (`17 01 + 09 01`) and gates the `MicCapture` frame flow via the
+    injected `mic_capture_mute` / `mic_capture_unmute` callables. The
+    USB Audio Class claim stays held by `process_audio` throughout, so
+    the hardware mute button keeps emitting `KEY_MICMUTE` on evdev and
+    wake-word framing stays alive.
     """
 
     def __init__(
         self,
         *,
         loop: asyncio.AbstractEventLoop,
-        audio_control: Optional[AudioControl] = None,
-        mic_capture_abort: Optional[Callable[[], None]] = None,
+        mic_capture_mute: Optional[Callable[[], None]] = None,
+        mic_capture_unmute: Optional[Callable[[], None]] = None,
         on_phone_cancel: Optional[PhoneCancelCallback] = None,
         on_phone_button: Optional[PhoneButtonCallback] = None,
         on_volume_change: Optional[VolumePublishCallback] = None,
@@ -114,24 +120,28 @@ class LedController:
         self.bar = LedBar(on_state_changed=self._dispatch_volume)
         self.phone = LedPhone(self._writer)
         self.ring = LedRing(self._writer)
-        # LedMute requires AudioControl to drive the Path A audio-claim
-        # release. If absent (tests, pre-wired startup), `set_private`
-        # falls back to a cosmetic-only path — visible red but mic stream
-        # NOT actually suppressed. See [[calisto-cosmetic-vs-functional-
-        # mute]] for the boundary.
-        self.mute: Optional[LedMute] = None
-        if audio_control is not None:
-            self.mute = LedMute(
-                self._writer,
-                audio_control,
-                on_state=self._dispatch_mute_state,
-                on_mic_capture_abort=mic_capture_abort,
-            )
+        # Path B cosmetic mute + MicCapture frame-gate. Always present —
+        # there is no fallback path. mic_capture_mute / _unmute can be
+        # None for tests that don't wire MicCapture; in that case the
+        # mute LEDs paint but mic frames are not gated (the test fakes
+        # already prove the gate semantics independently).
+        self.mute = LedMute(
+            self._writer,
+            mic_capture_mute=mic_capture_mute,
+            mic_capture_unmute=mic_capture_unmute,
+            on_state=self._dispatch_mute_state,
+        )
 
         self._buttons = HidButtonListener(
             on_phone_press=self._dispatch_phone_press,
             on_volume_press=self._dispatch_button_volume,
+            on_mute_press=self._dispatch_mute_hidraw_press,
         )
+        # Evdev listener remains as defence-in-depth — if a firmware update
+        # ever starts surfacing KEY_MICMUTE again (as in the original Test 3
+        # measurement), this path will still trigger the in-process toggle.
+        # On current firmware in PC Media mode it stays silent — the hidraw
+        # `0x0B` press path above is the load-bearing trigger.
         self._mute_listener = EvdevMuteListener(
             on_mute_press=self._dispatch_mute_press,
         )
@@ -254,6 +264,15 @@ class LedController:
         if normalised == "unmute":
             self.set_private(False, source="mqtt")
             return
+        # While muted, suppress all other legacy verbs — they would write
+        # phone/ring/bar LEDs and dim the red overlay. Same gate as
+        # `on_state`: mute is the visual source of truth.
+        if self.is_private():
+            _LOGGER.debug(
+                "apply_legacy(%r) suppressed — muted; mute overlay is source of truth",
+                payload,
+            )
+            return
         if normalised == "off":
             self.phone.off()
         elif normalised == "wake":
@@ -279,11 +298,12 @@ class LedController:
     def set_private(self, want: bool, *, source: str) -> bool:
         """Enter or exit private mode. Returns True on success.
 
-        When `self.mute` is attached (AudioControl was injected), runs the
-        Path A audio-release wake-sequence dance — true firmware mute, mic
-        stream functionally stopped. Otherwise falls back to cosmetic-only:
-        visible red palette via `17 01 + 09 01`, mic stream NOT suppressed.
-        See [[calisto-cosmetic-vs-functional-mute]] for the boundary.
+        Path B: paints the cosmetic red palette (`17 01 + 09 01` on
+        enter, `09 00 + 17 00` on exit) and gates the MicCapture frame
+        flow via the injected callables. The USB Audio Class claim is
+        NOT released — the hardware mute button + wake-word listener
+        stay alive throughout. See [[calisto-cosmetic-vs-functional-
+        mute]] for the boundary.
         """
         with self._state_lock:
             if want == self._muted:
@@ -296,40 +316,24 @@ class LedController:
 
         _LOGGER.info("private %s (source=%s)", "ON" if want else "OFF", source)
 
-        mute = self.mute
-        if mute is not None:
-            ok = mute.enter_private() if want else mute.exit_private()
-            with self._state_lock:
-                self._muted = want if ok else not want
-            if not ok:
-                _LOGGER.error(
-                    "set_private(%s): LedMute transition failed; staying %s",
-                    want,
-                    "muted" if self._muted else "unmuted",
-                )
-            if not want and ok:
-                self._render_last_state()
-            return ok
-
-        # Cosmetic-only fallback (no AudioControl). Mic stream NOT
-        # suppressed — see boundary note above.
+        # Suppress any in-flight cosmetic state palette before painting
+        # red — on_state suppression-while-muted prevents future writes
+        # but in-flight pulse threads (LedPhone.listening_pulse) keep
+        # writing their own bytes until told to stop.
         if want:
             self.phone.off()
-            ok = self._writer.write_seq(
-                (REPORT_OFFHOOK_LED, 0x01),
-                (REPORT_MUTE_LED, 0x01),
-                pause=0.05,
-            )
-        else:
-            ok = self._writer.write_seq(
-                (REPORT_MUTE_LED, 0x00),
-                (REPORT_OFFHOOK_LED, 0x00),
-                pause=0.05,
-            )
-            self._render_last_state()
+
+        ok = self.mute.enter_private() if want else self.mute.exit_private()
         with self._state_lock:
             self._muted = want if ok else not want
-        self._dispatch_mute_state(self._muted)
+        if not ok:
+            _LOGGER.error(
+                "set_private(%s): LedMute transition failed; staying %s",
+                want,
+                "muted" if self._muted else "unmuted",
+            )
+        if not want and ok:
+            self._render_last_state()
         return ok
 
     def is_private(self) -> bool:
@@ -395,6 +399,26 @@ class LedController:
             self._loop.call_soon_threadsafe(self.toggle_private)
             return
         self._loop.call_soon_threadsafe(cb)
+
+    def _dispatch_mute_hidraw_press(self) -> None:
+        """Hardware mute-button press observed via hidraw `0x0B 0x01`.
+        Each physical press toggles firmware's internal mute state
+        (firmware does the functional mute itself); we mirror by
+        toggling LVA's `_muted` flag and re-driving the cosmetic +
+        MicCapture-gate path so HA / MQTT stay in sync.
+
+        Press/release are emitted as a pair by the firmware — the
+        listener already filters to press-only with debounce, so each
+        call here corresponds to a real button press.
+        """
+        # call_soon_threadsafe takes positional args only — wrap in a
+        # closure so we can pass the `source` keyword.
+        self._loop.call_soon_threadsafe(
+            lambda: self.set_private(
+                not self.is_private(),
+                source="hardware-button",
+            )
+        )
 
     def _dispatch_volume(self, pct: int) -> None:
         # bar callback fires from whichever thread called bar.apply().
