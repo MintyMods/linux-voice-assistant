@@ -87,6 +87,9 @@ class HABridge:
         # Stage F K.13 — admin/restart accepted via MQTT for L4-driven
         # remote restart.
         self.admin_restart_topic = f"calisto/{room}/admin/restart"
+        # Stage D — speaker-enrollment trigger topic (HA-driven flow).
+        # Result is published on `calisto/<room>/enroll/result`.
+        self.enroll_capture_topic = f"calisto/{room}/enroll/capture"
         # Retained state topics — Lovelace cards + v0 automations read these.
         self.led_state_topic = f"calisto/{room}/led/state"
         self.volume_state_topic = f"calisto/{room}/volume/state"
@@ -119,6 +122,8 @@ class HABridge:
         # supplies a callable that triggers a clean process exit (so
         # systemd L3 respawns).
         self._restart_hook: Any = None
+        # Stage D — enrollment handler for `calisto/<room>/enroll/capture`.
+        self._enrollment_handler: Any = None
 
     def _lwt_payload(self) -> str:
         return json.dumps(
@@ -216,6 +221,8 @@ class HABridge:
                         (self.cancel_topic, 1),
                         (self.cancel_all_topic, 1),
                         (self.admin_restart_topic, 1),
+                        # Stage D — speaker enrollment HA→LVA trigger.
+                        (self.enroll_capture_topic, 1),
                     ]
                 )
             except Exception:
@@ -364,6 +371,19 @@ def _on_message(self: HABridge, _client: Any, _userdata: Any, msg: Any) -> None:
             source=obj.get("source") or ("mqtt_all" if topic == self.cancel_all_topic else "mqtt"),
             request_id=obj.get("request_id"),
         )
+        return
+
+    # Stage D — speaker enrollment trigger. Delegates to EnrollmentHandler
+    # which marshals the embed + store-write onto the asyncio loop.
+    if topic == self.enroll_capture_topic:
+        handler = self._enrollment_handler
+        if handler is None:
+            _LOGGER.debug("HABridge: enroll/capture received but no handler attached")
+            return
+        try:
+            handler.handle(raw_payload)
+        except Exception:
+            _LOGGER.exception("HABridge: enrollment handler raised")
         return
 
     # Stage F K.13 — admin/restart triggers a clean process exit so
@@ -577,10 +597,16 @@ def _attach_restart_hook(self: HABridge, hook: Any) -> None:
     self._restart_hook = hook
 
 
+def _attach_enrollment_handler(self: HABridge, handler: Any) -> None:
+    """Wire an EnrollmentHandler for `calisto/<room>/enroll/capture` (D)."""
+    self._enrollment_handler = handler
+
+
 HABridge.attach_led_controller = _attach_led_controller  # type: ignore[attr-defined]
 HABridge.attach_audio_controllers = _attach_audio_controllers  # type: ignore[attr-defined]
 HABridge.attach_cancel_coordinator = _attach_cancel_coordinator  # type: ignore[attr-defined]
 HABridge.attach_restart_hook = _attach_restart_hook  # type: ignore[attr-defined]
+HABridge.attach_enrollment_handler = _attach_enrollment_handler  # type: ignore[attr-defined]
 HABridge._on_message = _on_message  # type: ignore[attr-defined]
 HABridge._route_say = _route_say  # type: ignore[attr-defined]
 HABridge.publish_volume_state = _publish_volume_state  # type: ignore[attr-defined]

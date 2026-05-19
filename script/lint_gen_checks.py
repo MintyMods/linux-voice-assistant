@@ -45,6 +45,9 @@ EXPLICIT_ALLOWLIST = {
     # name suffix. These are HA-side write-handlers, gen-independent by
     # nature (e.g. volume changes are intentionally cross-session).
     "set_volume_callback",
+    # `attach_*_handler` / `*_handler` setters on HABridge — wire-time
+    # plumbing, not K.1 callback handlers.
+    "_attach_enrollment_handler",
 }
 
 GEN_DECORATORS = {"gen_checked", "gen_independent"}

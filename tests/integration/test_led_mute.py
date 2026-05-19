@@ -540,6 +540,8 @@ def test_on_connect_subscribes_to_all_back_compat_topics(fake_paho):
         bridge.cancel_topic,
         bridge.cancel_all_topic,
         bridge.admin_restart_topic,
+        # Stage D — speaker enrollment trigger.
+        bridge.enroll_capture_topic,
     }
     # All at QoS 1.
     qos_values = {qos for _t, qos in fake.subscriptions}

@@ -1,0 +1,106 @@
+"""Stage D integration tests — HABridge enroll/capture routing and the
+WakeCapture snapshot + sidecar plumbing the SpeakerVerifier relies on."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+from linux_voice_assistant.enrollment import EnrollmentHandler
+from linux_voice_assistant.ha_bridge import HABridge
+from linux_voice_assistant.speaker_verifier import EnrollmentsStore, SpeakerVerifier
+from linux_voice_assistant.wake_capture import WakeCapture
+
+from tests.conftest import make_server_state
+
+
+def _build_bridge(fake_paho):
+    created, factory = fake_paho
+    bridge = HABridge(room="lounge", host="127.0.0.1", port=1883, client_factory=factory)
+    bridge.start()
+    return bridge, created[0]
+
+
+def test_habridge_subscribes_to_enroll_capture(fake_paho):
+    bridge, fake = _build_bridge(fake_paho)
+    subs = {t for t, _ in fake.subscriptions}
+    assert "calisto/lounge/enroll/capture" in subs
+
+
+def test_habridge_routes_enroll_capture_to_handler(fake_paho, tmp_path):
+    bridge, fake = _build_bridge(fake_paho)
+    state = make_server_state()
+    state.room = "lounge"
+    state.wake_capture = MagicMock(
+        snapshot_recent_pcm=MagicMock(return_value=b"\x00\x00" * 24000),
+    )
+    store = EnrollmentsStore(tmp_path / "enrollments.json", room="lounge")
+    verifier = SpeakerVerifier(store=store, model_path=None)
+    verifier.embed = MagicMock(return_value=[0.1] * 512)
+    verifier.outlier_check = MagicMock(return_value=True)
+    state.speaker_verifier = verifier
+    handler = EnrollmentHandler(state, ha_bridge=bridge)
+    bridge.attach_enrollment_handler(handler)
+
+    msg = MagicMock(
+        topic="calisto/lounge/enroll/capture",
+        payload=json.dumps({"user_id": "rob", "phrase": "test"}).encode(),
+    )
+    bridge._on_message(fake, None, msg)
+
+    user = store.find_user("rob")
+    assert user is not None
+    assert len(user.embeddings) == 1
+
+
+# -- WakeCapture snapshot + sidecar plumbing ------------------------------
+
+
+def test_wake_capture_snapshot_recent_pcm(tmp_path):
+    wc = WakeCapture(
+        capture_dir=tmp_path, room="lounge", device_id="dev",
+    )
+    # 1s @ 16kHz mono int16 = 32000 bytes = 16000 two-byte samples.
+    wc.feed(b"\x01\x00" * 16000)
+    wc.feed(b"\x02\x00" * 16000)
+    pcm = wc.snapshot_recent_pcm(1.0)
+    assert len(pcm) == 32000
+    # The tail-slice should be the most-recent 1s — the \x02 chunk.
+    assert pcm.startswith(b"\x02\x00")
+
+
+def test_wake_capture_snapshot_capped_at_ring_extent(tmp_path):
+    wc = WakeCapture(capture_dir=tmp_path, room="lounge", device_id="dev")
+    wc.feed(b"\x01\x00" * 8000)  # 0.5s only (16000 bytes)
+    pcm = wc.snapshot_recent_pcm(5.0)  # ask for 5s — ring has 0.5s
+    assert len(pcm) == 16000
+
+
+def test_update_speaker_match_writes_to_sidecar(tmp_path):
+    wc = WakeCapture(capture_dir=tmp_path, room="lounge", device_id="dev")
+    wc.feed(b"\x00" * 32000)
+    wake_id = wc.on_wake_fire(score=0.8)
+    # Sidecar written synchronously since no executor loop attached.
+    wc.update_speaker_match(wake_id, {"matched_user_id": "rob", "score": 0.91})
+    sidecar = json.loads(Path(tmp_path / f"{wake_id}.wav.json").read_text())
+    assert sidecar["speaker_match"]["matched_user_id"] == "rob"
+
+
+def test_update_wake_label_gate2_reject(tmp_path):
+    wc = WakeCapture(capture_dir=tmp_path, room="lounge", device_id="dev")
+    wc.feed(b"\x00" * 32000)
+    wake_id = wc.on_wake_fire(score=0.8)
+    assert wc.update_wake_label(wake_id, "gate2_reject", "gate2_reject") is True
+    sidecar = json.loads(Path(tmp_path / f"{wake_id}.wav.json").read_text())
+    assert sidecar["label"] == "gate2_reject"
+    assert sidecar["label_reason"] == "gate2_reject"
+
+
+def test_update_wake_label_invalid_label_rejected(tmp_path):
+    wc = WakeCapture(capture_dir=tmp_path, room="lounge", device_id="dev")
+    wc.feed(b"\x00" * 32000)
+    wake_id = wc.on_wake_fire(score=0.8)
+    assert wc.update_wake_label(wake_id, "purple", "nope") is False

@@ -37,6 +37,7 @@ dependencies = [
     "httpx>=0.27,<1",
     "wyoming>=1.9,<2",
     "ten-vad>=1.0.6,<2",
+    "onnxruntime>=1.16,<2",
 ]
 dynamic = ["version"]
 

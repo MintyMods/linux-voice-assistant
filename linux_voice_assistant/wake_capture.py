@@ -360,6 +360,73 @@ class WakeCapture:
             },
         )
 
+    # ---- Stage D — SpeakerVerifier integration --------------------------
+
+    def snapshot_recent_pcm(self, duration_s: float) -> bytes:
+        """Return the most-recent `duration_s` seconds of the ring as PCM.
+
+        Used by SpeakerVerifier in `process_audio` (audio thread). The ring
+        is mutated only at the tail by feed(), so a tail-slice can race
+        with one append — but the slice we extract under the lock is a
+        consistent snapshot of bytes that arrived strictly before this
+        call. Bounded by the ring's actual extent (3s).
+        """
+        max_bytes = int(duration_s * SAMPLE_RATE * SAMPLE_WIDTH_BYTES * CHANNELS)
+        with self._ring_lock:
+            joined = b"".join(self._ring)
+            if max_bytes >= len(joined):
+                return joined
+            return joined[-max_bytes:]
+
+    def update_speaker_match(self, wake_id_str: str, match: Dict[str, Any]) -> None:
+        """Set `speaker_match` on a wake's sidecar. Safe to call before or
+        after the disk write — pending entries cache the update; on-disk
+        entries are patched in place."""
+        sidecar_path = self.capture_dir / f"{wake_id_str}.wav.json"
+        with self._pending_lock:
+            entry = self._pending.get(wake_id_str)
+            if entry is not None:
+                entry["sidecar_template"]["speaker_match"] = match
+                if not entry.get("written", False):
+                    return
+        self._patch_sidecar(sidecar_path, {"speaker_match": match})
+
+    def update_wake_label(
+        self, wake_id_str: str, label: str, label_reason: str,
+    ) -> bool:
+        """Set the sidecar label directly by wake_id (no session_id required).
+
+        Used by the Stage D pre-LISTENING gates (Gate 1 silent drop, Gate 2
+        reject) which fire before any session_id is minted. Returns True on
+        a successful patch."""
+        if label not in ("positive", "negative", "ambiguous", "gate2_reject"):
+            return False
+        sidecar_path = self.capture_dir / f"{wake_id_str}.wav.json"
+        with self._pending_lock:
+            entry = self._pending.get(wake_id_str)
+            if entry is not None and not entry.get("written", False):
+                entry["sidecar_template"]["label"] = label
+                entry["sidecar_template"]["label_reason"] = label_reason
+                entry["sidecar_template"]["label_updated_ts"] = _utc_iso(self._clock())
+                # Drop from pending — Stage D wake events never bind a
+                # session, so leaving them in `_pending` would block the
+                # orphan sweep from cleaning up disk.
+                self._pending.pop(wake_id_str, None)
+                return True
+        if not sidecar_path.exists():
+            return False
+        self._patch_sidecar(
+            sidecar_path,
+            {
+                "label": label,
+                "label_reason": label_reason,
+                "label_updated_ts": _utc_iso(self._clock()),
+            },
+        )
+        with self._pending_lock:
+            self._pending.pop(wake_id_str, None)
+        return True
+
     def manual_label(self, wake_id_str: str, label: str, user: str = "manual") -> bool:
         """HTTP-endpoint entry: rewrite sidecar with a manually-chosen label."""
         if label not in ("positive", "negative", "ambiguous", "gate2_reject"):

@@ -24,8 +24,10 @@ from .audible_notify import AudibleNotifyArbiter, ChimeController
 from .audio_control import AudioControl
 from .bridge_client import BridgeClient
 from .cancel import CancelCoordinator
+from .enrollment import EnrollmentHandler
 from .ha_bridge import HABridge
 from .heartbeat import HeartbeatPublisher
+from .speaker_verifier import EnrollmentsStore, SpeakerVerifier
 from .led import LedController
 from .mic_capture import MicCapture, SpeechBuffer
 from .models import Preferences, ServerState
@@ -861,6 +863,50 @@ def _start_stage_b_components(state: ServerState, loop: asyncio.AbstractEventLoo
         hb_interval,
     )
 
+    # Stage D — SpeakerVerifier (D2). Constructed even when no model file
+    # is present so the gate hook in process_audio can always call into a
+    # live object; the verifier degrades to accept-all when its CAM++
+    # session is unavailable.
+    sv_enabled_env = os.environ.get("SV_ENABLED", "1") not in ("0", "false", "no", "off")
+    state.sv_enabled = sv_enabled_env
+    try:
+        state.sv_threshold = float(os.environ.get("SV_THRESHOLD", str(state.sv_threshold)))
+    except ValueError:
+        pass
+    enrollments_default = Path.home() / "calisto-led" / "data" / f"enrollments-{room}.json"
+    enrollments_path = Path(os.environ.get("SV_ENROLLMENTS_PATH", enrollments_default))
+    model_path_env = os.environ.get("CAMPLUS_MODEL_PATH")
+    model_path = Path(model_path_env) if model_path_env else (_REPO_DIR / "models" / "campplus.onnx")
+    fallback_policy = os.environ.get("SV_FALLBACK_POLICY", "accept_all")
+    enrollments = EnrollmentsStore(
+        enrollments_path,
+        room=room,
+        threshold=state.sv_threshold,
+        fallback_policy=fallback_policy,
+    )
+    try:
+        enrollments.load()
+    except Exception:
+        _LOGGER.exception("EnrollmentsStore.load raised; verifier will accept all")
+    # Threshold from the file (if set) overrides the env default.
+    state.sv_threshold = enrollments.threshold
+    state.speaker_verifier = SpeakerVerifier(
+        store=enrollments,
+        model_path=model_path,
+        enabled=state.sv_enabled,
+    )
+    _LOGGER.info(
+        "Stage D wired: SpeakerVerifier enabled=%s users=%d model=%s threshold=%.2f",
+        state.sv_enabled, len(enrollments.users), model_path, state.sv_threshold,
+    )
+
+    if ha_bridge is not None:
+        enrollment_handler = EnrollmentHandler(state, ha_bridge=ha_bridge, loop=loop)
+        try:
+            ha_bridge.attach_enrollment_handler(enrollment_handler)
+        except Exception:
+            _LOGGER.exception("Stage D: ha_bridge.attach_enrollment_handler raised")
+
 
 def _start_stage_e1_led(state: ServerState, loop: asyncio.AbstractEventLoop) -> None:
     """Construct LedController + wire its callbacks into DeviceSession / HABridge.
@@ -1045,6 +1091,77 @@ def _start_stage_e2_audio(state: ServerState, loop: asyncio.AbstractEventLoop) -
         arbiter is not None,
         bridge is not None,
     )
+
+
+def _run_speaker_gates(state: ServerState, wake_id: Optional[str]) -> bool:
+    """Stage D — run Gate 1 + Gate 2 against the wake's pre-roll audio.
+
+    Returns True when the verifier passes (or is disabled / accept-all).
+    Returns False when either gate rejects — in which case it has already
+    handled the rejection UX (chime, LED flash) and patched the sidecar
+    label. The caller skips `satellite.wakeup`.
+    """
+    verifier = getattr(state, "speaker_verifier", None)
+    if verifier is None:
+        return True
+    wake_capture = getattr(state, "wake_capture", None)
+    if wake_capture is None:
+        # No ring to snapshot. Without an audio source, the gates can't
+        # decide — accept all and rely on the LLM-side cancel tools.
+        return True
+    if not verifier.is_active():
+        return True
+    pcm = wake_capture.snapshot_recent_pcm(verifier.verify_window_ms / 1000.0)
+    if not pcm:
+        return True
+    try:
+        result = verifier.verify(pcm)
+    except Exception:
+        _LOGGER.exception("SpeakerVerifier.verify raised; accept-all fallback")
+        return True
+    if wake_id is not None:
+        try:
+            wake_capture.update_speaker_match(wake_id, result.to_dict())
+        except Exception:
+            _LOGGER.exception("WakeCapture.update_speaker_match raised")
+    if result.gate1_pass and result.gate2_pass:
+        return True
+    # Reject UX + sidecar labelling. Gate 1 fails silently per D2;
+    # Gate 2 fires the audible+visible rejection.
+    if not result.gate1_pass:
+        _LOGGER.info("Speaker gates: Gate 1 (VAD) failed — silent drop")
+        if wake_id is not None:
+            try:
+                wake_capture.update_wake_label(wake_id, "negative", "gate1_fail_vad")
+            except Exception:
+                _LOGGER.exception("WakeCapture.update_wake_label raised")
+        return False
+    _LOGGER.info(
+        "Speaker gates: Gate 2 (CAM++) failed score=%.3f threshold=%.3f",
+        result.score, result.threshold,
+    )
+    # Audible rejection chime — gated by sv_audible_notify.
+    if state.sv_audible_notify:
+        chime = getattr(state, "chime_controller", None)
+        if chime is not None:
+            try:
+                chime.play("dialog-error.ogg")
+            except Exception:
+                _LOGGER.exception("ChimeController.play raised for rejection chime")
+    # Visible red flash via the LED hard-cancel overlay.
+    led = getattr(state, "led_controller", None)
+    if led is not None:
+        from .session import State as _State
+        try:
+            led.on_state(_State.CANCELLING, cancel_reason="GATE2_REJECT")
+        except Exception:
+            _LOGGER.exception("LedController.on_state raised for GATE2_REJECT flash")
+    if wake_id is not None:
+        try:
+            wake_capture.update_wake_label(wake_id, "gate2_reject", "gate2_reject")
+        except Exception:
+            _LOGGER.exception("WakeCapture.update_wake_label raised")
+    return False
 
 
 def process_audio(state: ServerState, mic, block_size: int):
@@ -1286,6 +1403,17 @@ def process_audio(state: ServerState, mic, block_size: int):
                                             )
                                         except Exception:
                                             _LOGGER.exception("WakeCapture.on_wake_fire raised")
+                                    # Stage D — two-gate speaker verification.
+                                    # Runs BEFORE wake chime per D2. Accept-all
+                                    # fallback applies when no model / enrollments.
+                                    verified = _run_speaker_gates(state, wake_id)
+                                    if not verified:
+                                        # Verifier already handled the user-
+                                        # visible rejection (silent on Gate 1,
+                                        # chime+red-flash on Gate 2) and the
+                                        # sidecar label. Skip wakeup entirely.
+                                        last_active = now
+                                        continue
                                     state.satellite.wakeup(wake_word, wake_id=wake_id)
                                     # Stage F2 — record for K.2 wake_count_5m.
                                     try:

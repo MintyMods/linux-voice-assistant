@@ -59,6 +59,8 @@ K15_SUBSCRIPTION_MATRIX: List[SubscriptionSpec] = [
     SubscriptionSpec("calisto/all/mute/set", 1, "LedController.set_private", "M3"),
     # K.13 — admin control plane.
     SubscriptionSpec("calisto/<room>/admin/restart", 1, "HABridge restart_hook", "K.13"),
+    # Stage D — speaker enrollment HA-driven trigger (D2).
+    SubscriptionSpec("calisto/<room>/enroll/capture", 1, "EnrollmentHandler", "D2"),
 ]
 
 

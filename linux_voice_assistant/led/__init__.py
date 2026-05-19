@@ -242,7 +242,10 @@ class LedController:
             # F4: SOFT silent (no extra LED change — the subsequent IDLE
             # transition clears via `phone.off`). HARD flashes the red
             # cosmetic palette as a transient acknowledgement.
-            if cancel_reason == "RED_BUTTON_HARD":
+            # Stage D — GATE2_REJECT (speaker verification fail) flashes
+            # the same red palette so the user sees the rejection visually
+            # alongside the audible chime.
+            if cancel_reason in ("RED_BUTTON_HARD", "GATE2_REJECT"):
                 self._hard_cancel_overlay()
             # otherwise SOFT — fall through, no LED action here
         elif new_state == State.DEGRADED:
