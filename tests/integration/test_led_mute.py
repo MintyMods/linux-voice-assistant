@@ -531,6 +531,11 @@ def test_on_connect_subscribes_to_all_back_compat_topics(fake_paho):
         bridge.ring_set_all_topic,
         bridge.mute_set_topic,
         bridge.mute_set_all_topic,
+        bridge.alarm_set_topic,
+        bridge.alarm_set_all_topic,
+        bridge.alarm_stop_topic,
+        bridge.say_topic,
+        bridge.say_all_topic,
     }
     # All at QoS 1.
     qos_values = {qos for _t, qos in fake.subscriptions}

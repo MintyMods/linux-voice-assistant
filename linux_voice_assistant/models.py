@@ -172,6 +172,12 @@ class ServerState:
     duck_attack_ms: int = 150
     duck_release_ms: int = 300
 
+    # Stage E.2 — alarm + audible-notify orchestration (G3, E6, K.8/K.9, K.10).
+    # All Any-typed to avoid an import cycle through the dataclass annotations.
+    alarm_controller: Any = None
+    chime_controller: Any = None
+    audible_notify_arbiter: Any = None
+
     def save_preferences(self) -> None:
         """Save preferences as JSON."""
         _LOGGER.debug("Saving preferences: %s", self.preferences_path)

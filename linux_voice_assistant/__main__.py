@@ -18,7 +18,9 @@ from getmac import get_mac_address  # type: ignore
 from pymicro_wakeword import MicroWakeWord, MicroWakeWordFeatures
 from pyopen_wakeword import OpenWakeWord, OpenWakeWordFeatures
 
+from .alarm import AlarmController
 from .asr_client import ASRClient
+from .audible_notify import AudibleNotifyArbiter, ChimeController
 from .audio_control import AudioControl
 from .bridge_client import BridgeClient
 from .ha_bridge import HABridge
@@ -440,6 +442,11 @@ async def main() -> None:
     # after DeviceSession so cancel callbacks can route through it.
     _start_stage_e1_led(state, loop)
 
+    # Stage E.2 — alarm / chime orchestration + K.10 say. Constructs the
+    # AudibleNotifyArbiter, AlarmController, and ChimeController and wires
+    # the alarm/say MQTT routing into HABridge.
+    _start_stage_e2_audio(state, loop)
+
     # Auto discovery (zeroconf, mDNS)
     discovery = HomeAssistantZeroconf(port=args.port, name=state.name, mac_address=state.mac_address, host_ip_address=host_ip_address)
     await discovery.register_server()
@@ -657,7 +664,9 @@ def _start_stage_b_components(state: ServerState, loop: asyncio.AbstractEventLoo
     whisper_uri = os.environ.get("WYOMING_WHISPER_URI")
     piper_uri = os.environ.get("WYOMING_PIPER_URI")
     asr_language = os.environ.get("ASR_LANGUAGE", "en")
-    piper_voice = os.environ.get("PIPER_VOICE") or None
+    # E1 — default Piper voice is en_GB-jenny_dioco-medium per
+    # architecture-v1-decisions §E. Deploys can override via PIPER_VOICE.
+    piper_voice = os.environ.get("PIPER_VOICE") or "en_GB-jenny_dioco-medium"
     hotwords_raw = os.environ.get("ASR_HOTWORDS", "")
     hotwords = [w.strip() for w in hotwords_raw.split(",") if w.strip()]
 
@@ -676,9 +685,27 @@ def _start_stage_b_components(state: ServerState, loop: asyncio.AbstractEventLoo
         _LOGGER.warning("WYOMING_WHISPER_URI not set; v1 audio path disabled (ASR off)")
 
     if piper_uri:
+        # Stage E.2 E2/E3 — opt into the streaming PCM path via TTS_STREAMING=1.
+        # Default remains the Stage B3 tempfile path (TTSOutput); flipping the
+        # flag on hardware lets us measure first-audio latency without
+        # touching code.
+        use_streaming = os.environ.get("TTS_STREAMING", "0") in ("1", "true", "yes", "on")
         try:
-            state.tts_output = TTSOutput(piper_uri, voice=piper_voice)
-            _LOGGER.info("TTSOutput initialised (uri=%s voice=%s)", piper_uri, piper_voice)
+            if use_streaming:
+                from .tts_streaming import TTSStreamingOutput
+
+                state.tts_output = TTSStreamingOutput(
+                    piper_uri,
+                    voice=piper_voice,
+                    audio_device=args.audio_output_device,
+                )
+                _LOGGER.info(
+                    "TTSStreamingOutput initialised (uri=%s voice=%s device=%s)",
+                    piper_uri, piper_voice, args.audio_output_device,
+                )
+            else:
+                state.tts_output = TTSOutput(piper_uri, voice=piper_voice)
+                _LOGGER.info("TTSOutput initialised (uri=%s voice=%s)", piper_uri, piper_voice)
         except Exception:
             _LOGGER.exception("TTSOutput construction failed")
     else:
@@ -890,6 +917,74 @@ def _start_stage_e1_led(state: ServerState, loop: asyncio.AbstractEventLoop) -> 
     _LOGGER.info(
         "Stage E.1: LedController started (mute=Path B cosmetic + mic-gate, mqtt=%s)",
         "wired" if bridge is not None else "absent",
+    )
+
+
+def _start_stage_e2_audio(state: ServerState, loop: asyncio.AbstractEventLoop) -> None:
+    """Construct AlarmController + AudibleNotifyArbiter + ChimeController.
+
+    DeviceSession must already be on `state`. HABridge is optional — when
+    absent the controllers still work locally (no K.9 publish, no /set
+    routing); useful for headless test boxes that drive alarms by direct
+    method call rather than MQTT.
+    """
+    from .session import State as _State
+
+    session = state.device_session
+    if session is None:
+        _LOGGER.error("Stage E.2: state.device_session missing — alarm/chime disabled")
+        return
+
+    def _current_state() -> _State:
+        ds = state.device_session
+        if ds is None:
+            return _State.IDLE
+        return ds.state_value
+
+    def _alarm_ringing() -> bool:
+        ac = state.alarm_controller
+        return bool(ac is not None and ac.is_ringing)
+
+    arbiter = AudibleNotifyArbiter(
+        state_getter=_current_state,
+        alarm_ringing_getter=_alarm_ringing,
+    )
+    state.audible_notify_arbiter = arbiter
+
+    state.chime_controller = ChimeController(
+        chime_player=state.chime_player,
+        arbiter=arbiter,
+    )
+
+    state.alarm_controller = AlarmController(
+        alarm_player=state.alarm_player,
+        music_player=state.music_player,
+        room=state.room,
+        ha_bridge=state.ha_bridge,
+    )
+
+    # HABridge needs to know about the alarm + audible-notify surface so the
+    # alarm/set + say MQTT topics route through. attach is best-effort.
+    bridge = state.ha_bridge
+    if bridge is not None:
+        try:
+            bridge.attach_audio_controllers(
+                alarm=state.alarm_controller,
+                chime=state.chime_controller,
+                tts_player=state.tts_player,
+                tts_output=state.tts_output,
+                arbiter=arbiter,
+                loop=loop,
+            )
+        except Exception:
+            _LOGGER.exception("Stage E.2: HABridge.attach_audio_controllers raised")
+
+    _LOGGER.info(
+        "Stage E.2: alarm + audible-notify wired (alarm=%s chime=%s arbiter=%s ha_bridge=%s)",
+        state.alarm_controller is not None,
+        state.chime_controller is not None,
+        arbiter is not None,
+        bridge is not None,
     )
 
 

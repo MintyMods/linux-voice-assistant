@@ -73,6 +73,12 @@ class HABridge:
         # `on` | `off` (also accepts the legacy `mute` | `unmute`).
         self.mute_set_topic = f"calisto/{room}/mute/set"
         self.mute_set_all_topic = "calisto/all/mute/set"
+        # Stage E.2 K.8/K.9 + K.10 — alarm + ad-hoc TTS announce.
+        self.alarm_set_topic = f"calisto/{room}/alarm/set"
+        self.alarm_set_all_topic = "calisto/all/alarm/set"
+        self.alarm_stop_topic = f"calisto/{room}/alarm/stop"
+        self.say_topic = f"calisto/{room}/say"
+        self.say_all_topic = "calisto/all/say"
         # Retained state topics — Lovelace cards + v0 automations read these.
         self.led_state_topic = f"calisto/{room}/led/state"
         self.volume_state_topic = f"calisto/{room}/volume/state"
@@ -89,6 +95,14 @@ class HABridge:
         self._client: Any = None
         self._connected = False
         self._led_controller: Any = None
+        # Stage E.2 — alarm/chime/say surface. attach_audio_controllers wires
+        # these post-construction so HABridge can be tested in isolation.
+        self._alarm: Any = None
+        self._chime: Any = None
+        self._tts_player: Any = None
+        self._tts_output: Any = None
+        self._arbiter: Any = None
+        self._loop: Any = None
 
     def _lwt_payload(self) -> str:
         return json.dumps(
@@ -175,6 +189,11 @@ class HABridge:
                         (self.ring_set_all_topic, 1),
                         (self.mute_set_topic, 1),
                         (self.mute_set_all_topic, 1),
+                        (self.alarm_set_topic, 1),
+                        (self.alarm_set_all_topic, 1),
+                        (self.alarm_stop_topic, 1),
+                        (self.say_topic, 1),
+                        (self.say_all_topic, 1),
                     ]
                 )
             except Exception:
@@ -279,23 +298,58 @@ def _attach_led_controller(self: HABridge, controller: Any) -> None:
 
 
 def _on_message(self: HABridge, _client: Any, _userdata: Any, msg: Any) -> None:
-    """Route a subscribed control topic to the attached LedController.
+    """Route a subscribed control topic to the attached LedController or
+    Stage E.2 audio controllers.
 
-    Topics:
+    Topics (LED, lowercased payload):
         calisto/<room>/led/set      → controller.apply_legacy(payload)
         calisto/all/led/set         → controller.apply_legacy(payload)
         calisto/<room>/volume/set   → controller.bar.apply(payload)
         calisto/<room>/ring/set     → controller.ring.start() / .stop()
         calisto/<room>/mute/set     → controller.set_private(payload, source="mqtt")
+
+    Topics (alarm/say — payload kept as raw bytes for JSON parsing):
+        calisto/<room>/alarm/set    → alarm.set_alarm(raw_bytes) (K.8)
+        calisto/all/alarm/set       → alarm.set_alarm(raw_bytes)
+        calisto/<room>/alarm/stop   → alarm.stop_alarm()
+        calisto/<room>/say          → tts/chime per scope (K.10)
+        calisto/all/say             → tts/chime per scope
     """
+    try:
+        topic = msg.topic
+        raw_payload = bytes(msg.payload) if msg.payload is not None else b""
+    except Exception:
+        _LOGGER.exception("HABridge: malformed MQTT message")
+        return
+
+    # Alarm + say handlers want the raw bytes (JSON); the LED back-compat
+    # handlers want a lowercased string. Dispatch by topic first.
+    if topic in (self.alarm_set_topic, self.alarm_set_all_topic):
+        if self._alarm is not None:
+            try:
+                self._alarm.set_alarm(raw_payload)
+            except Exception:
+                _LOGGER.exception("HABridge: alarm/set routing raised")
+        return
+    if topic == self.alarm_stop_topic:
+        if self._alarm is not None:
+            try:
+                self._alarm.stop_alarm()
+            except Exception:
+                _LOGGER.exception("HABridge: alarm/stop routing raised")
+        return
+    if topic in (self.say_topic, self.say_all_topic):
+        self._route_say(raw_payload)
+        return
+
+    # LED back-compat surface — lower-case the payload for legacy verbs.
     controller = self._led_controller
     if controller is None:
         return
     try:
-        topic = msg.topic
-        payload = msg.payload.decode("utf-8", errors="replace").strip().lower()
+        payload = raw_payload.decode("utf-8", errors="replace").strip().lower()
     except Exception:
-        _LOGGER.exception("HABridge: malformed MQTT message")
+        _LOGGER.exception("HABridge: malformed LED payload")
         return
     _LOGGER.debug("HABridge recv %s = %r", topic, payload)
     try:
@@ -327,6 +381,110 @@ def _on_message(self: HABridge, _client: Any, _userdata: Any, msg: Any) -> None:
         _LOGGER.exception("HABridge: routing %s = %r raised", topic, payload)
 
 
+def _attach_audio_controllers(
+    self: HABridge,
+    *,
+    alarm: Any,
+    chime: Any,
+    tts_player: Any,
+    tts_output: Any,
+    arbiter: Any,
+    loop: Any,
+) -> None:
+    """Wire Stage E.2 audio controllers post-construction.
+
+    `alarm` may be None for tests that don't exercise alarms — say/chime
+    still work without it. Same for `tts_output`/`tts_player` when only the
+    chime tier is being tested.
+    """
+    self._alarm = alarm
+    self._chime = chime
+    self._tts_player = tts_player
+    self._tts_output = tts_output
+    self._arbiter = arbiter
+    self._loop = loop
+    # Now that the bridge has a publisher reference, retro-attach so the
+    # alarm controller's first publish_state goes out cleanly.
+    if alarm is not None and hasattr(alarm, "attach_ha_bridge"):
+        try:
+            alarm.attach_ha_bridge(self)
+        except Exception:
+            _LOGGER.exception("HABridge.attach_audio_controllers: alarm.attach_ha_bridge raised")
+
+
+def _route_say(self: HABridge, raw_payload: bytes) -> None:
+    """Parse a K.10 say payload and dispatch through tts_output or chime.
+
+    {"text": "...", "scope": "tts"|"chime", "interrupt": bool, "voice": "..."}
+
+    On unknown scope or empty text, log + drop. interrupt is not honoured
+    here — barge-in is the existing cancel chain's responsibility.
+    """
+    import json
+
+    try:
+        obj = json.loads(raw_payload.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        _LOGGER.warning("HABridge say: malformed payload %r", raw_payload[:80])
+        return
+    if not isinstance(obj, dict):
+        _LOGGER.warning("HABridge say: payload must be JSON object")
+        return
+    text = str(obj.get("text") or "").strip()
+    if not text:
+        _LOGGER.debug("HABridge say: empty text; dropping")
+        return
+    scope = str(obj.get("scope") or "tts").lower()
+
+    arbiter = self._arbiter
+    if scope == "chime":
+        chime = self._chime
+        if chime is None:
+            _LOGGER.warning("HABridge say(chime): no ChimeController wired")
+            return
+        # For chime scope, `text` is a chime sound slug (e.g. "Ping.ogg")
+        # — not synthesized speech. K.10 treats the field uniformly.
+        chime.play(text)
+        return
+
+    if arbiter is not None and not arbiter.allow_say_tts():
+        _LOGGER.info("HABridge say(tts): suppressed by arbiter (alarm ringing)")
+        return
+
+    tts_output = self._tts_output
+    tts_player = self._tts_player
+    loop = self._loop
+    if tts_output is None or tts_player is None or loop is None:
+        _LOGGER.warning(
+            "HABridge say(tts): missing components (output=%s player=%s loop=%s)",
+            tts_output is not None,
+            tts_player is not None,
+            loop is not None,
+        )
+        return
+
+    voice = obj.get("voice")
+    voice_override = str(voice) if isinstance(voice, str) and voice else None
+    if voice_override is not None and hasattr(tts_output, "voice"):
+        # tts_output.speak() uses self.voice; override transiently. The
+        # client is recreated per-call in tts_output.py so this is safe.
+        try:
+            tts_output.voice = voice_override
+        except Exception:
+            pass
+
+    async def _do_speak() -> None:
+        try:
+            await tts_output.speak(tts_player, text=text)
+        except Exception:
+            _LOGGER.exception("HABridge say(tts): tts_output.speak raised")
+
+    try:
+        loop.call_soon_threadsafe(lambda: loop.create_task(_do_speak()))
+    except RuntimeError:
+        _LOGGER.warning("HABridge say(tts): loop not running")
+
+
 def _publish_volume_state(self: HABridge, pct: int) -> None:
     """Publish retained `calisto/<room>/volume/state` = `<pct>`."""
     self.publish(self.volume_state_topic, str(int(pct)), qos=1, retain=True)
@@ -353,7 +511,9 @@ def _publish_phone_button(self: HABridge, action: str) -> None:
 
 
 HABridge.attach_led_controller = _attach_led_controller  # type: ignore[attr-defined]
+HABridge.attach_audio_controllers = _attach_audio_controllers  # type: ignore[attr-defined]
 HABridge._on_message = _on_message  # type: ignore[attr-defined]
+HABridge._route_say = _route_say  # type: ignore[attr-defined]
 HABridge.publish_volume_state = _publish_volume_state  # type: ignore[attr-defined]
 HABridge.publish_mute_state = _publish_mute_state  # type: ignore[attr-defined]
 HABridge.publish_ring_state = _publish_ring_state  # type: ignore[attr-defined]
