@@ -218,8 +218,22 @@ class HeartbeatPublisher:
             "wake_count_5m": self._wake_count_5m(now),
             "cancel_count_5m": self._cancel_count_5m(),
             "state_publishes_per_min": self._state_publishes_per_min(),
+            "wake_arb_stats": self._wake_arb_stats(),
             "subsystems": self._subsystem_health(mic_active, hidraw_ok),
         }
+
+    def _wake_arb_stats(self) -> dict:
+        """Stage H J1 — fold the 24h won/lost/avg-margin counters into the
+        heartbeat payload so the N.2 sensors can read them without owning
+        a separate publish loop. Empty dict when no arbiter is wired."""
+        arb = getattr(self._state, "wake_arbiter", None)
+        if arb is None:
+            return {"won_24h": 0, "lost_24h": 0, "avg_margin_24h": 0.0}
+        try:
+            return arb.stats_snapshot()
+        except Exception:
+            _LOGGER.exception("WakeArbiter.stats_snapshot raised")
+            return {"won_24h": 0, "lost_24h": 0, "avg_margin_24h": 0.0}
 
     def _state_publishes_per_min(self) -> int:
         counter = getattr(self._state, "state_publish_counter", None)

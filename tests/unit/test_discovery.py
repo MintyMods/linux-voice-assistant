@@ -644,3 +644,24 @@ def test_state_publish_counter_trims_outside_window(monkeypatch):
     assert counter.count() == 1
     base[0] = 1120.0  # both expired
     assert counter.count() == 0
+
+
+# ============================================================================
+# Stage H — N.2 wake-arbitration entries
+# ============================================================================
+
+
+def test_entity_surface_emits_stage_h_wake_arbitration_sensors():
+    surface, bridge = _make_surface()
+    surface.publish_configs()
+    cfgs = _published_configs(bridge)
+
+    won = cfgs["calisto_lounge_wake_arbitrations_won_24h"]
+    assert won["state_topic"] == "calisto/lounge/heartbeat"
+    assert "wake_arb_stats.won_24h" in won["value_template"]
+
+    lost = cfgs["calisto_lounge_wake_arbitrations_lost_24h"]
+    assert "wake_arb_stats.lost_24h" in lost["value_template"]
+
+    margin = cfgs["calisto_lounge_wake_arbitration_avg_margin_24h"]
+    assert "wake_arb_stats.avg_margin_24h" in margin["value_template"]

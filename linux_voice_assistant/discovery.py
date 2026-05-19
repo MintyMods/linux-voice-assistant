@@ -546,6 +546,33 @@ class EntitySurface:
              "unit_of_measurement": "/min"},
         ))
 
+        # Stage H J1 — wake-arbitration 24h stats. HeartbeatPublisher folds
+        # the WakeArbiter snapshot into `wake_arb_stats.{won,lost,avg_margin}`
+        # so these sensors read it the same way state_publishes_per_min does.
+        configs.append((
+            "sensor", "wake_arbitrations_won_24h",
+            {**self._common("wake_arbitrations_won_24h", "Wake Arbitrations Won 24h"),
+             "state_topic": self.heartbeat_topic,
+             "value_template": "{{ value_json.wake_arb_stats.won_24h | default(0) }}",
+             "icon": "mdi:trophy",
+             "unit_of_measurement": "wakes"},
+        ))
+        configs.append((
+            "sensor", "wake_arbitrations_lost_24h",
+            {**self._common("wake_arbitrations_lost_24h", "Wake Arbitrations Lost 24h"),
+             "state_topic": self.heartbeat_topic,
+             "value_template": "{{ value_json.wake_arb_stats.lost_24h | default(0) }}",
+             "icon": "mdi:trophy-broken",
+             "unit_of_measurement": "wakes"},
+        ))
+        configs.append((
+            "sensor", "wake_arbitration_avg_margin_24h",
+            {**self._common("wake_arbitration_avg_margin_24h", "Wake Arbitration Avg Margin 24h"),
+             "state_topic": self.heartbeat_topic,
+             "value_template": "{{ value_json.wake_arb_stats.avg_margin_24h | default(0.0) }}",
+             "icon": "mdi:vector-difference"},
+        ))
+
         return configs
 
     # ------------------------------------------------------------------ publish

@@ -207,6 +207,10 @@ class ServerState:
     # "Alarm clock.ogg") — resolution happens at play-time via
     # `resolve_alarm_sound`.
     alarm_ringtone: str = "Alarm clock.ogg"
+    # Stage H J1 — WakeArbiter (multi-device confidence-based arbitration).
+    # Constructed in `_start_stage_b_components` once room + HABridge are
+    # known; the audio thread consults it BEFORE speaker verification.
+    wake_arbiter: Any = None
     # Wake-fire timestamps in monotonic seconds, retained for rolling
     # 5-minute counters in the K.2 heartbeat. Bounded by trim-on-append.
     wake_events: Any = field(default_factory=list)

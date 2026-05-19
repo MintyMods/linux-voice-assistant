@@ -97,9 +97,18 @@ class WakeArbiter:
         self._enabled = bool(enabled)
         self._lock = threading.Lock()
         self._events: Deque[PeerEvent] = deque()
+        # Per-device monotonic wake-id counter (K.5 schema). Distinct from
+        # Stage C's `wake_capture` uuid — that one indexes capture files;
+        # this one indexes arbitration events on the wire.
+        self._next_wake_id = 0
         # 24h rolling stats — (ts_monotonic, margin) for won/lost decisions.
         self._won: Deque[Tuple[float, float]] = deque()
         self._lost: Deque[Tuple[float, float]] = deque()
+
+    def _take_wake_id(self) -> int:
+        with self._lock:
+            self._next_wake_id += 1
+            return self._next_wake_id
 
     # ------------------------------------------------------------- tunables
 
@@ -173,9 +182,9 @@ class WakeArbiter:
     def arbitrate(
         self,
         *,
-        wake_id: int,
         score: float,
         peak_score: float,
+        wake_id: Optional[int] = None,
     ) -> bool:
         """Publish own wake_arb, wait for peers, return True iff we win.
 
@@ -186,6 +195,8 @@ class WakeArbiter:
         """
         if not self._enabled:
             return True
+        if wake_id is None:
+            wake_id = self._take_wake_id()
         publish = self._publish
         local_ts = time.time()
         payload = {

@@ -545,10 +545,14 @@ def test_on_connect_subscribes_to_all_back_compat_topics(fake_paho):
         # Stage D — SV live tunables (N.2 rows 143 + 153).
         bridge.sv_threshold_set_topic,
         bridge.sv_audible_notify_set_topic,
+        # Stage H J1 — fleet-wide wake arbitration (K.5).
+        bridge.wake_arb_topic,
     }
-    # All at QoS 1.
-    qos_values = {qos for _t, qos in fake.subscriptions}
-    assert qos_values == {1}
+    # All at QoS 1 except K.5 wake_arb which is QoS 0 per spec.
+    qos_by_topic = dict(fake.subscriptions)
+    assert qos_by_topic[bridge.wake_arb_topic] == 0
+    other_qos = {qos for t, qos in fake.subscriptions if t != bridge.wake_arb_topic}
+    assert other_qos == {1}
 
 
 def test_ha_bridge_routes_calisto_all_volume_set(fake_paho, asyncio_loop, writer, mic_gate, monkeypatch):

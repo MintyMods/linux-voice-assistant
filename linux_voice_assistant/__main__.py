@@ -900,6 +900,26 @@ def _start_stage_b_components(state: ServerState, loop: asyncio.AbstractEventLoo
         state.sv_enabled, len(enrollments.users), model_path, state.sv_threshold,
     )
 
+    # Stage H J1 — WakeArbiter. Constructed even when HABridge isn't wired
+    # (solo dev box) so the audio thread's `wake_arbiter.arbitrate(...)` is
+    # never None. Without an MQTT publisher the arbiter still waits its
+    # window but treats every wake as solo, which is the correct fallback
+    # for a single-device deploy.
+    try:
+        from .wake_arbiter import WakeArbiter as _WakeArbiter
+
+        state.wake_arbiter = _WakeArbiter(
+            room=room,
+            device_id=os.environ.get("DEVICE_ID") or room,
+        )
+        if ha_bridge is not None:
+            try:
+                ha_bridge.attach_wake_arbiter(state.wake_arbiter)
+            except Exception:
+                _LOGGER.exception("Stage H: ha_bridge.attach_wake_arbiter raised")
+    except Exception:
+        _LOGGER.exception("Stage H: WakeArbiter construction failed")
+
     if ha_bridge is not None:
         enrollment_handler = EnrollmentHandler(state, ha_bridge=ha_bridge, loop=loop)
         try:
@@ -1091,6 +1111,34 @@ def _register_stage_g_tunables(surface: "EntitySurface", state: "ServerState") -
         setter=_set_alarm_ringtone,
         icon="mdi:music-note",
     )
+
+    # Stage H J1 — wake-arbitration tunables. When the arbiter wasn't
+    # constructed (e.g. test stubs) the setters become no-ops.
+    arbiter = getattr(state, "wake_arbiter", None)
+    if arbiter is not None:
+        surface.register_tunable_number(
+            thing="wake_arbitration_wait_ms",
+            name_suffix="Wake Arbitration Wait",
+            min_value=50, max_value=500, step=25,
+            getter=lambda: int(arbiter.wait_ms),
+            setter=lambda v: arbiter.set_wait_ms(int(v)),
+            unit="ms", icon="mdi:timer-sand", is_int=True,
+        )
+        surface.register_tunable_number(
+            thing="wake_arbitration_tiebreak_band",
+            name_suffix="Wake Arbitration Tiebreak Band",
+            min_value=0.01, max_value=0.20, step=0.01,
+            getter=lambda: float(arbiter.tiebreak_band),
+            setter=lambda v: arbiter.set_tiebreak_band(float(v)),
+            icon="mdi:vector-difference",
+        )
+        surface.register_tunable_switch(
+            thing="wake_arbitration_enabled",
+            name_suffix="Wake Arbitration Enabled",
+            getter=lambda: bool(arbiter.enabled),
+            setter=lambda v: arbiter.set_enabled(bool(v)),
+            icon="mdi:swap-horizontal-bold",
+        )
 
     # I2 dashboard cancel button — publishes the K.3 cancel payload that
     # CancelCoordinator (already subscribed) parses and acts on.
@@ -1598,6 +1646,32 @@ def process_audio(state: ServerState, mic, block_size: int):
                                             )
                                         except Exception:
                                             _LOGGER.exception("WakeCapture.on_wake_fire raised")
+                                    # Stage H J1 — wake arbitration BEFORE speaker
+                                    # verification. Losers abort silently: no
+                                    # chime, no LED, no generation bump. The
+                                    # wake_capture sidecar is labelled negative
+                                    # so the retraining set captures the room
+                                    # acoustics for the loss case.
+                                    arbiter = getattr(state, "wake_arbiter", None)
+                                    if arbiter is not None:
+                                        try:
+                                            won = arbiter.arbitrate(
+                                                score=activation_score,
+                                                peak_score=activation_score,
+                                            )
+                                        except Exception:
+                                            _LOGGER.exception("WakeArbiter.arbitrate raised; treating as solo")
+                                            won = True
+                                        if not won:
+                                            if state.wake_capture is not None and wake_id is not None:
+                                                try:
+                                                    state.wake_capture.update_wake_label(
+                                                        wake_id, "negative", "arbitration_lost",
+                                                    )
+                                                except Exception:
+                                                    _LOGGER.exception("WakeCapture.update_wake_label raised")
+                                            last_active = now
+                                            continue
                                     # Stage D — two-gate speaker verification.
                                     # Runs BEFORE wake chime per D2. Accept-all
                                     # fallback applies when no model / enrollments.

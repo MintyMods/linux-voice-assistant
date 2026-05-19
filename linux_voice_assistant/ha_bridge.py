@@ -138,6 +138,13 @@ class HABridge:
         # Wired by EntitySurface when the state_publishes_per_min sensor
         # is added; HABridge.publish_state increments lazily via record().
         self._state_publish_counter: Any = None
+        # Stage H J1 — WakeArbiter. HABridge subscribes to the fleet-wide
+        # `calisto/wake_arb` topic and dispatches every payload to the
+        # arbiter's `on_peer_event` (paho callback thread). The arbiter
+        # uses HABridge.publish for its own emits.
+        self._wake_arbiter: Any = None
+        # K.5 topic — fleet-scoped, not per-room.
+        self.wake_arb_topic = "calisto/wake_arb"
 
     def _lwt_payload(self) -> str:
         return json.dumps(
@@ -240,6 +247,9 @@ class HABridge:
                         # Stage D — SV live tunables (N.2 rows 143 + 153).
                         (self.sv_threshold_set_topic, 1),
                         (self.sv_audible_notify_set_topic, 1),
+                        # Stage H J1 — fleet-wide wake arbitration. QoS 0
+                        # per K.5 (best-effort; lossy is fine).
+                        (self.wake_arb_topic, 0),
                     ]
                 )
             except Exception:
@@ -397,6 +407,18 @@ def _on_message(self: HABridge, _client: Any, _userdata: Any, msg: Any) -> None:
         raw_payload = bytes(msg.payload) if msg.payload is not None else b""
     except Exception:
         _LOGGER.exception("HABridge: malformed MQTT message")
+        return
+
+    # Stage H J1 — fleet-wide wake arbitration. The paho callback thread
+    # forwards every payload to the arbiter; the audio thread reads from
+    # the resulting ring buffer during its 200ms wait window.
+    if topic == self.wake_arb_topic:
+        arb = self._wake_arbiter
+        if arb is not None:
+            try:
+                arb.on_peer_event(raw_payload)
+            except Exception:
+                _LOGGER.exception("HABridge: WakeArbiter.on_peer_event raised")
         return
 
     # Stage F5 — K.3 / K.4 cancel routes through CancelCoordinator.
@@ -698,6 +720,19 @@ def _attach_state_publish_counter(self: HABridge, counter: Any) -> None:
     self._state_publish_counter = counter
 
 
+def _attach_wake_arbiter(self: HABridge, arbiter: Any) -> None:
+    """Wire a WakeArbiter (J1). HABridge forwards every `calisto/wake_arb`
+    payload to the arbiter and offers its own `publish` as the arbiter's
+    MQTT emitter so the arbiter doesn't open a second paho client."""
+    self._wake_arbiter = arbiter
+    try:
+        arbiter.attach_publisher(
+            lambda topic, payload: self.publish(topic, payload, qos=0, retain=False)
+        )
+    except Exception:
+        _LOGGER.exception("HABridge: WakeArbiter.attach_publisher raised")
+
+
 HABridge.attach_led_controller = _attach_led_controller  # type: ignore[attr-defined]
 HABridge.attach_audio_controllers = _attach_audio_controllers  # type: ignore[attr-defined]
 HABridge.attach_cancel_coordinator = _attach_cancel_coordinator  # type: ignore[attr-defined]
@@ -706,6 +741,7 @@ HABridge.attach_enrollment_handler = _attach_enrollment_handler  # type: ignore[
 HABridge.attach_speaker_verifier_discovery = _attach_speaker_verifier_discovery  # type: ignore[attr-defined]
 HABridge.attach_entity_surface = _attach_entity_surface  # type: ignore[attr-defined]
 HABridge.attach_state_publish_counter = _attach_state_publish_counter  # type: ignore[attr-defined]
+HABridge.attach_wake_arbiter = _attach_wake_arbiter  # type: ignore[attr-defined]
 HABridge._on_message = _on_message  # type: ignore[attr-defined]
 HABridge._route_say = _route_say  # type: ignore[attr-defined]
 HABridge.publish_volume_state = _publish_volume_state  # type: ignore[attr-defined]
