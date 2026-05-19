@@ -1,10 +1,17 @@
 # mpv_player.py
 import logging
+import time
 from typing import Callable, List, Optional, Union
 
 from .gen_check import gen_independent
 from .player.libmpv import LibMpvPlayer
 from .player.state import PlayerState
+
+
+# H5 §3 — respawn thresholds for the K.2 heartbeat channel_status surface.
+# Counts are over the rolling 30s window in `record_respawn`.
+CHANNEL_DEGRADED_THRESHOLD = 3
+CHANNEL_DEAD_THRESHOLD = 6
 
 
 class MpvMediaPlayer:
@@ -18,16 +25,19 @@ class MpvMediaPlayer:
     def __init__(self, device: str | None = None, role: str = "media") -> None:
         self._log = logging.getLogger(self.__class__.__name__)
         self.role = role
-        self._player = LibMpvPlayer(device=device, role=role)
+        self._player = LibMpvPlayer(
+            device=device,
+            role=role,
+            on_track_error=self._on_track_error,
+        )
         self._done_callback: Optional[Callable[[], None]] = None
         self._playlist: List[str] = []
-        # Stage F5 — per-channel supervisor metadata (G1 + H5).
-        # `channel_status` is read by the K.2 heartbeat publisher; the
-        # F5 follow-up adds the respawn-on-crash policy that drives it
-        # (silent for tts/chime, position-resume for media, immediate-
-        # resume-full-volume for alarm). For now `ok` baseline + manual
-        # demote via `mark_channel_degraded` / `_dead` keeps the heartbeat
-        # honest while the actual content-recovery is staged in.
+        # H5 §3 — `channel_status` is the live heartbeat surface read by
+        # the K.2 publisher. `_respawn_events` counts H5-class recoveries
+        # (libmpv `end-file reason=error` events) inside a rolling 30s
+        # window. In-process libmpv has no subprocess to respawn; a
+        # genuine libmpv crash collapses LVA and L1/L3 supervisors run.
+        # What we count here is track-level failure recoveries.
         self.channel_status: str = "ok"
         self._respawn_events: List[float] = []
 
@@ -47,14 +57,35 @@ class MpvMediaPlayer:
     def record_respawn(self, ts: float) -> int:
         """Append a respawn timestamp and return rolling 30s count.
 
-        Per H5 §3 mpv supervisor policy: >3 respawns in 30s → degraded.
-        Caller decides what to do with the count; supervisor demotes
-        `channel_status` accordingly.
+        Per H5 §3 mpv supervisor policy: ≥3 respawns in 30s → degraded;
+        ≥6 → dead. Caller may invoke directly; track-error recoveries
+        from LibMpvPlayer route through `_on_track_error` which calls
+        this with `time.time()` and updates channel_status from the
+        returned count.
         """
         cutoff = ts - 30.0
         self._respawn_events = [t for t in self._respawn_events if t >= cutoff]
         self._respawn_events.append(ts)
         return len(self._respawn_events)
+
+    @gen_independent
+    def _on_track_error(self, role: str) -> None:
+        """Bridge from LibMpvPlayer track-error recovery → heartbeat
+        demotion ladder. Each call records one respawn and demotes
+        channel_status based on the rolling 30s count."""
+        try:
+            count = self.record_respawn(time.time())
+        except Exception:
+            self._log.exception("record_respawn raised in track-error path")
+            return
+        if count >= CHANNEL_DEAD_THRESHOLD:
+            self.mark_channel_dead()
+        elif count >= CHANNEL_DEGRADED_THRESHOLD:
+            self.mark_channel_degraded()
+        self._log.warning(
+            "track-error on role=%s — rolling 30s respawn count=%d status=%s",
+            role, count, self.channel_status,
+        )
 
     def play(
         self,

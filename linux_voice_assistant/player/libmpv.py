@@ -1,6 +1,6 @@
 import logging
 import threading
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import mpv
 
@@ -19,11 +19,28 @@ class LibMpvPlayer(AudioPlayer):
     - volume handling with ducking support
     """
 
-    def __init__(self, device: Optional[str] = None, role: str = "media") -> None:
+    def __init__(
+        self,
+        device: Optional[str] = None,
+        role: str = "media",
+        on_track_error: Optional[Callable[[str], None]] = None,
+    ) -> None:
         self._log = logging.getLogger(self.__class__.__name__)
         self.role = role
         self._state: PlayerState = PlayerState.IDLE
         self._state_lock = threading.Lock()
+
+        # Stage F / H5 §3 — per-channel track-error recovery state.
+        # `on_track_error` is invoked AFTER recovery so the owning
+        # MpvMediaPlayer can update channel_status via record_respawn.
+        # In-process libmpv can't be "respawned" (a real crash takes LVA
+        # down and L1/L3 handle it); what we recover from here is mpv
+        # `end-file reason=error` — track-level failures (404, codec,
+        # transient I/O). The owner gets a single string arg describing
+        # the role for logging convenience.
+        self._on_track_error = on_track_error
+        self._last_url: Optional[str] = None
+        self._last_position: float = 0.0
 
         # Volume handling
         self._user_volume: float = 100.0  # 0.0 – 100.0
@@ -90,6 +107,20 @@ class LibMpvPlayer(AudioPlayer):
         self._mpv.event_callback("end-file")(self._on_end_file)
         self._mpv.event_callback("start-file")(self._on_start_file)
 
+        # H5 §3 media-resume — cache the most recent playback position so a
+        # mid-track error can re-issue `loadfile <url> start=<pos>`. We only
+        # observe for the media role; TTS/chime are short enough that
+        # position-resume would land mid-syllable, and alarm always
+        # restarts from the top.
+        if role == "media":
+            try:
+                self._mpv.observe_property("time-pos", self._on_time_pos_changed)
+            except Exception:
+                self._log.warning(
+                    "observe_property(time-pos) failed; media resume disabled",
+                    exc_info=True,
+                )
+
     # -------- Playback control --------
 
     def play(
@@ -110,6 +141,8 @@ class LibMpvPlayer(AudioPlayer):
             self._log.debug("play: current_state=%s", self._state)
             self._done_callback = done_callback
             self._set_state(PlayerState.LOADING)
+            self._last_url = url
+            self._last_position = 0.0
         self._mpv.pause = stop_first
         self._mpv.play(url)
 
@@ -245,6 +278,7 @@ class LibMpvPlayer(AudioPlayer):
     @gen_independent
     def _on_end_file(self, event) -> None:
         callback: Optional[Callable[[], None]] = None
+        is_error: bool = False
 
         with self._state_lock:
             # mpv events: event.data is a MpvEventEndFile object with a 'reason' attribute
@@ -255,24 +289,35 @@ class LibMpvPlayer(AudioPlayer):
             # mpv END_FILE_REASON constants:
             # 0 = eof (end of file), 1 = stop, 2 = abort, 3 = quit, 4 = error
             is_eof = reason == 0
+            is_error = reason == 4
 
             self._log.debug(
-                "_on_end_file: reason=%s (is_eof=%s), state=%s, has_callback=%s",
+                "_on_end_file: reason=%s (is_eof=%s, is_error=%s), state=%s, has_callback=%s",
                 reason,
                 is_eof,
+                is_error,
                 self._state,
                 self._done_callback is not None,
             )
 
-            # Only process "eof" (reason=0) events as actual track completion.
-            # Other reasons are from track changes, stops, or errors.
-            if not is_eof:
+            if is_error:
+                # H5 §3 — track-level error. Per-role recovery dispatched
+                # outside the state lock; we capture the done_callback now
+                # so a recovery reload that succeeds + completes still
+                # delivers a single playback_finished signal upstream.
+                self._set_state(PlayerState.IDLE)
+                callback = self._done_callback
+            elif is_eof:
+                self._set_state(PlayerState.IDLE)
+                callback = self._done_callback
+                self._done_callback = None
+            else:
                 self._log.debug("_on_end_file: ignoring non-eof event (reason=%s)", reason)
                 return
 
-            self._set_state(PlayerState.IDLE)
-            callback = self._done_callback
-            self._done_callback = None
+        if is_error:
+            self._handle_track_error(callback)
+            return
 
         if callback is not None:
             self._log.debug("_on_end_file: invoking callback")
@@ -281,6 +326,107 @@ class LibMpvPlayer(AudioPlayer):
             except RuntimeError:
                 # Callback errors must never break the player
                 pass
+
+    def _handle_track_error(self, captured_callback: Optional[Callable[[], None]]) -> None:
+        """H5 §3 per-channel recovery for an `end-file reason=error` event.
+
+        - tts / chime: silent — fire the captured done_callback so the
+          DeviceSession lifecycle advances past SPEAKING / WAKING normally.
+          The user gets silence rather than a stale state.
+        - media: re-issue `loadfile <last_url> start=<last_position>` so
+          the user hears "the music came back". When no last_url is
+          available (error before any play) we fall through to firing the
+          callback so the channel doesn't sit stuck in LOADING.
+        - alarm: re-issue `loadfile <last_url> loop-playlist=inf` at full
+          volume immediately. An alarm MUST NOT be silenced by a crash.
+
+        Owner notification (`on_track_error`) always fires last so the
+        heartbeat surface (channel_status / record_respawn) is updated
+        regardless of which branch was taken.
+        """
+        role = self.role
+        url = self._last_url
+        position = self._last_position
+        recovered = False
+
+        try:
+            if role in ("tts", "chime"):
+                self._done_callback = None
+                if captured_callback is not None:
+                    try:
+                        captured_callback()
+                    except RuntimeError:
+                        pass
+            elif role == "media" and url:
+                try:
+                    start_arg = f"start={max(0.0, float(position)):.2f}"
+                    self._mpv.command("loadfile", url, "replace", start_arg)
+                    recovered = True
+                    with self._state_lock:
+                        self._set_state(PlayerState.LOADING)
+                except Exception:
+                    self._log.warning(
+                        "media track-error recovery: loadfile raised; firing done_callback",
+                        exc_info=True,
+                    )
+                    self._done_callback = None
+                    if captured_callback is not None:
+                        try:
+                            captured_callback()
+                        except RuntimeError:
+                            pass
+            elif role == "alarm" and url:
+                try:
+                    self._mpv.command("loadfile", url, "replace", "loop-playlist=inf")
+                    try:
+                        self._mpv.volume = 100.0
+                    except Exception:
+                        pass
+                    recovered = True
+                    with self._state_lock:
+                        self._user_volume = 100.0
+                        self._duck_factor = 1.0
+                        self._set_state(PlayerState.LOADING)
+                except Exception:
+                    self._log.warning(
+                        "alarm track-error recovery: loadfile raised; firing done_callback",
+                        exc_info=True,
+                    )
+                    self._done_callback = None
+                    if captured_callback is not None:
+                        try:
+                            captured_callback()
+                        except RuntimeError:
+                            pass
+            else:
+                # role is media/alarm but no url cached — nothing to reload.
+                self._done_callback = None
+                if captured_callback is not None:
+                    try:
+                        captured_callback()
+                    except RuntimeError:
+                        pass
+        finally:
+            self._log.info(
+                "_handle_track_error: role=%s recovered=%s url=%s pos=%.2f",
+                role, recovered, url, position,
+            )
+            cb = self._on_track_error
+            if cb is not None:
+                try:
+                    cb(role)
+                except Exception:
+                    self._log.exception("on_track_error callback raised")
+
+    @gen_independent
+    def _on_time_pos_changed(self, _name: str, value: Any) -> None:
+        """Cache the most recent playback position for media-role resume."""
+        if value is None:
+            return
+        try:
+            self._last_position = float(value)
+        except (TypeError, ValueError):
+            return
 
     @gen_independent
     def _on_start_file(self, event) -> None:
