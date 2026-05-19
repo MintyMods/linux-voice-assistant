@@ -156,6 +156,13 @@ class LedController:
         """Monotonic timestamp of the last hidraw read (F2 — heartbeat)."""
         return getattr(self._buttons, "last_event_ts", 0.0)
 
+    @property
+    def hidraw_device_present(self) -> bool:
+        """True iff the ButtonListener currently has the Calisto hidraw open.
+        Heartbeat uses this to flip `hidraw_ok` when the USB phone is
+        unplugged but LVA itself keeps publishing heartbeats."""
+        return getattr(self._buttons, "is_open", False)
+
     # ---- lifecycle ----------------------------------------------------
 
     def start(self) -> None:

@@ -73,20 +73,28 @@ _BTN_VOL_UP = 0x02
 _BTN_VOL_DOWN = 0x04
 _BTN_PHONE = 0x80
 
-# Firmware mute-button report (`0x0b 0xNN`). Empirically confirmed
-# 2026-05-18 on the lounge unit: when the hardware mute button is
-# pressed in PC Media mode, the Calisto firmware handles the mute
-# itself (paints LEDs red + clips mic audio + beeps) and emits a
-# press/release PAIR on hidraw 0x0B — `KEY_MICMUTE` on evdev does
-# NOT fire. The hidraw probe captured each physical press as
-# `0x0b 0x01` (press) immediately followed by `0x0b 0x00` (release).
+# Firmware mute-button report (`0x0b 0xNN`). The Calisto's `0x0B` input
+# is the standard Telephony > Headset collection: bit 0 = Hook Switch
+# (Usage 000B:0020), bit 1 = Phone Mute (Usage 000B:002F).
 #
-# Treat `0x0b 0x01` as a single momentary press event (button-click
-# semantics, NOT an absolute state); ignore the release. Each press
-# toggles the LVA mute state. Debounced at 0.5 s to absorb the
-# membrane bounce.
+# CORRECTION (2026-05-19): a descriptor decode (see
+# `docs/calisto_hid_protocol.md` §6c + the lines-198..202 table) showed
+# the byte values mean:
+#   0x0B 0x03 — BOTH bits set: real hardware mute-button press
+#   0x0B 0x01 — Hook Switch only; firmware's hook-state mirror, emitted
+#               spontaneously when an audio claim toggles (e.g. when LVA
+#               plays the wake chime). NOT a user button press.
+#   0x0B 0x00 — both bits clear; idle.
+#
+# Pre-correction code treated `0x01` as a press, which caused spurious
+# mute-toggle storms whenever LVA started/stopped audio playback. Now
+# we accept `0x03` only. The evdev `KEY_MICMUTE` path (Test 3 of
+# `mute_button_probe_results.md`, 100% reliable in PC Media mode) is
+# the primary mute trigger; hidraw 0x03 is bonus redundancy.
+#
+# Debounced at 0.5 s to absorb any membrane bounce on a real press.
 _MUTE_REPORT_ID = 0x0B
-_MUTE_PRESS = 0x01
+_MUTE_PRESS = 0x03
 _MUTE_RELEASE = 0x00
 _MUTE_BUTTON_DEBOUNCE_S = 0.5
 
@@ -229,6 +237,10 @@ class HidButtonListener:
         # Stage F2 — last successful hidraw read timestamp (monotonic).
         # Heartbeat reads this to assert hidraw_ok (event seen <5s ago).
         self.last_event_ts: float = 0.0
+        # True iff the hidraw fh is currently open. Distinguishes "quiet
+        # device" from "device unplugged" so heartbeat hidraw_ok doesn't
+        # fall back to True when no Calisto is present.
+        self.is_open: bool = False
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -271,9 +283,11 @@ class HidButtonListener:
                 if self._stop.wait(_RECONNECT_BACKOFF_S):
                     return
                 continue
+            self.is_open = True
             try:
                 self._read_loop(fh)
             finally:
+                self.is_open = False
                 try:
                     fh.close()
                 except OSError:

@@ -141,6 +141,42 @@ def test_hidraw_ok_false_when_event_stale():
     assert _payload_of(ha)["hidraw_ok"] is False
 
 
+def test_hidraw_ok_false_when_device_not_present():
+    """Phone unplugged from boot: ButtonListener never opens fh,
+    `hidraw_device_present` stays False, heartbeat must report not-ok even
+    though `last_hid_event_ts` is still 0.0 (init value)."""
+    pub, ha, state = _publisher()
+    state.led_controller = MagicMock()
+    state.led_controller.hidraw_device_present = False
+    state.led_controller.last_hid_event_ts = 0.0
+    pub.publish_once()
+    assert _payload_of(ha)["hidraw_ok"] is False
+
+
+def test_hidraw_ok_true_when_device_present_and_quiet():
+    """Phone plugged in, no buttons pressed yet: device open, last_event_ts
+    still 0.0. Must remain ok (the quiet-host fallback)."""
+    pub, ha, state = _publisher()
+    state.led_controller = MagicMock()
+    state.led_controller.hidraw_device_present = True
+    state.led_controller.last_hid_event_ts = 0.0
+    pub.publish_once()
+    assert _payload_of(ha)["hidraw_ok"] is True
+
+
+def test_hidraw_ok_true_when_device_present_but_event_stale():
+    """Phone plugged in and a button was pressed >5s ago: device file is
+    still open, listener is alive waiting on the next press. Must stay ok
+    so a single vol-down doesn't flip the dashboard to disconnected 5s
+    later."""
+    pub, ha, state = _publisher()
+    state.led_controller = MagicMock()
+    state.led_controller.hidraw_device_present = True
+    state.led_controller.last_hid_event_ts = time.monotonic() - 60.0
+    pub.publish_once()
+    assert _payload_of(ha)["hidraw_ok"] is True
+
+
 def test_wake_count_uses_state_wake_events():
     pub, ha, state = _publisher()
     now = time.monotonic()

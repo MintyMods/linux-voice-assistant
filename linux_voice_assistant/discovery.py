@@ -41,7 +41,7 @@ SENSOR_DEFS = [
     ("wake_positives_24h", "Wake Positives 24h", "positive_24h", "mdi:check-circle"),
     ("wake_negatives_24h", "Wake Negatives 24h", "negative_24h", "mdi:close-circle"),
     ("wake_ambiguous_24h", "Wake Ambiguous 24h", "ambiguous_24h", "mdi:help-circle"),
-    ("wake_gate2_rejects_24h", "Wake Gate-2 Rejects 24h", "gate2_reject_24h", "mdi:account-cancel"),
+    ("wake_gate2_rejects_24h", "Wake Gate2 Rejects 24h", "gate2_reject_24h", "mdi:account-cancel"),
     ("wake_pending_triage", "Wake Pending Triage", "pending_triage_count", "mdi:inbox-multiple"),
 ]
 
@@ -229,7 +229,7 @@ class SpeakerVerifierDiscovery:
         threshold_uid = f"calisto_{self.room}_sv_threshold"
         threshold_cfg_topic = f"{DISCOVERY_PREFIX}/number/{threshold_uid}/config"
         threshold_payload = {
-            "name": f"{self.room.title()} Speaker Verify Threshold",
+            "name": "Speaker Verify Threshold",
             "unique_id": threshold_uid,
             "object_id": threshold_uid,
             "state_topic": self.threshold_state_topic,
@@ -251,7 +251,7 @@ class SpeakerVerifierDiscovery:
         notify_uid = f"calisto_{self.room}_sv_audible_notify"
         notify_cfg_topic = f"{DISCOVERY_PREFIX}/switch/{notify_uid}/config"
         notify_payload = {
-            "name": f"{self.room.title()} Speaker Verify Audible Notify",
+            "name": "Speaker Verify Audible Notify",
             "unique_id": notify_uid,
             "object_id": notify_uid,
             "state_topic": self.audible_notify_state_topic,
@@ -436,7 +436,7 @@ class EntitySurface:
     def _common(self, thing: str, name_suffix: str) -> Dict[str, Any]:
         unique_id = f"calisto_{self.room}_{thing}"
         return {
-            "name": f"{self.room.title()} {name_suffix}",
+            "name": name_suffix,
             "unique_id": unique_id,
             "object_id": unique_id,
             "device": self._device_block(),
@@ -478,11 +478,13 @@ class EntitySurface:
         ))
 
         # Connectivity (K.2 LWT-driven).
+        # Gated on hidraw_ok: LVA process alive AND Calisto phone HID present.
+        # `expire_after` covers the LVA-dead path (no heartbeat).
         configs.append((
             "binary_sensor", "online",
             {**self._common("online", "Online"),
              "state_topic": self.heartbeat_topic,
-             "value_template": "{{ 'online' if value_json else 'offline' }}",
+             "value_template": "{{ 'online' if value_json.hidraw_ok else 'offline' }}",
              "payload_on": "online",
              "payload_off": "offline",
              "device_class": "connectivity",
@@ -876,8 +878,4 @@ class EntitySurface:
             "payload_press": press_payload,
             "icon": icon,
         }
-        # Buttons don't have availability_template — payload_press fires
-        # regardless, and HA's availability_topic alone (set via _common)
-        # handles online/offline. Remove the template that doesn't apply.
-        payload.pop("availability_template", None)
         self._tunable_configs.append(("button", thing, payload))

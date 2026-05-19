@@ -273,13 +273,22 @@ class HeartbeatPublisher:
         led = getattr(self._state, "led_controller", None)
         if led is None:
             return False
-        # LedController exposes its HID listener's last-read timestamp via
-        # `last_hid_event_ts` when wired (Stage F1 addition).
+        # `ButtonListener._read_loop` calls `fh.read(64)` which blocks
+        # forever between physical button events. `last_event_ts` therefore
+        # only advances on presses — using it as a liveness proxy with a
+        # short window meant a single vol-down press flipped the dashboard
+        # to "disconnected" 5s later even though the device was healthy.
+        # The correct signal is whether the listener currently holds an
+        # open fh on the Calisto hidraw node (`is_open` / hidraw_device_present).
+        present = getattr(led, "hidraw_device_present", None)
+        if present is False:
+            return False
+        if present is True:
+            return True
+        # Tests that mock LedController without the new attribute fall back
+        # to the legacy last_event_ts path so they keep working.
         last = getattr(led, "last_hid_event_ts", None)
         if last is None or not isinstance(last, (int, float)) or last <= 0:
-            # No event yet — fall back to "controller exists" liveness so a
-            # quiet host doesn't trip OFFLINE; the HID listener thread itself
-            # is the load-bearing assertion (process exit kills heartbeat).
             return True
         return (now - float(last)) < _HID_LIVE_S
 

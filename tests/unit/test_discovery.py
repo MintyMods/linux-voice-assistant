@@ -277,6 +277,9 @@ def test_publish_configs_emits_connectivity_binary_sensors():
     assert online["expire_after"] == 300
     assert online["payload_on"] == "online"
     assert online["payload_off"] == "offline"
+    # Gated on hidraw_ok so the binary_sensor flips off when the Calisto USB
+    # phone is unplugged while LVA itself keeps publishing heartbeats.
+    assert "hidraw_ok" in online["value_template"]
 
     bridge_cfg = cfgs["calisto_lounge_bridge_reachable"]
     assert bridge_cfg["device_class"] == "connectivity"
@@ -607,7 +610,7 @@ def test_register_button_publishes_config():
     btn = cfgs["calisto_lounge_stop"]
     assert btn["command_topic"] == "calisto/lounge/cancel"
     assert btn["payload_press"] == '{"reason":"DASHBOARD","source":"ha_dashboard"}'
-    assert "availability_template" not in btn  # buttons don't need it
+    assert btn["availability_template"] == "{{ 'online' if value_json else 'offline' }}"
     # Button doesn't claim a subscription (LVA already subscribes to cancel).
     assert "calisto/lounge/cancel" not in surface.subscription_topics()
 
