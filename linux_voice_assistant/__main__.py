@@ -921,7 +921,8 @@ def _start_stage_b_components(state: ServerState, loop: asyncio.AbstractEventLoo
             _LOGGER.exception("Stage D: SpeakerVerifierDiscovery construction failed")
 
         # Stage G — N.2 static per-room catalogue. Read-only sensors mirror
-        # session/state + heartbeat; tunables registered in later commits.
+        # session/state + heartbeat; tunables (numbers / switches / select /
+        # button) are registered below.
         try:
             entity_surface = EntitySurface(
                 ha_bridge=ha_bridge,
@@ -929,10 +930,106 @@ def _start_stage_b_components(state: ServerState, loop: asyncio.AbstractEventLoo
                 state=state,
             )
             ha_bridge.attach_entity_surface(entity_surface)
+            _register_stage_g_tunables(entity_surface, state)
             entity_surface.start()
             state.entity_surface = entity_surface
         except Exception:
             _LOGGER.exception("Stage G: EntitySurface construction failed")
+
+
+def _register_stage_g_tunables(surface: "EntitySurface", state: "ServerState") -> None:
+    """Register the N.2 live-tunable rows on the EntitySurface.
+
+    Setters write the backing field, then propagate to any in-process
+    consumer (configure_duck_envelope on each mpv player, save_preferences
+    for wake_sensitivity, HeartbeatPublisher.set_interval for the cadence).
+    """
+
+    def _set_wake_sensitivity(value: float) -> None:
+        state.wake_word_1_threshold = float(value)
+        state.preferences.wake_word_1_sensitivity = float(value)
+        try:
+            state.save_preferences()
+        except Exception:
+            _LOGGER.exception("Stage G: save_preferences raised after wake_sensitivity update")
+
+    surface.register_tunable_number(
+        thing="wake_sensitivity",
+        name_suffix="Wake Sensitivity",
+        min_value=0.1, max_value=0.9, step=0.05,
+        getter=lambda: float(state.wake_word_1_threshold),
+        setter=_set_wake_sensitivity,
+        icon="mdi:waveform",
+    )
+
+    def _apply_duck_envelope() -> None:
+        for player in (state.music_player, state.tts_player, state.chime_player, state.alarm_player):
+            if player is None:
+                continue
+            try:
+                player.configure_duck_envelope(
+                    floor_pct=state.duck_floor_pct,
+                    attack_ms=state.duck_attack_ms,
+                    release_ms=state.duck_release_ms,
+                )
+            except Exception:
+                _LOGGER.exception("Stage G: configure_duck_envelope raised")
+
+    def _set_duck_floor(value: int) -> None:
+        state.duck_floor_pct = int(value)
+        _apply_duck_envelope()
+
+    def _set_duck_attack(value: int) -> None:
+        state.duck_attack_ms = int(value)
+        _apply_duck_envelope()
+
+    def _set_duck_release(value: int) -> None:
+        state.duck_release_ms = int(value)
+        _apply_duck_envelope()
+
+    surface.register_tunable_number(
+        thing="duck_floor_pct",
+        name_suffix="Duck Floor %",
+        min_value=10, max_value=80, step=5,
+        getter=lambda: int(state.duck_floor_pct),
+        setter=_set_duck_floor,
+        unit="%", icon="mdi:volume-medium", is_int=True,
+    )
+    surface.register_tunable_number(
+        thing="duck_attack_ms",
+        name_suffix="Duck Attack",
+        min_value=50, max_value=500, step=10,
+        getter=lambda: int(state.duck_attack_ms),
+        setter=_set_duck_attack,
+        unit="ms", icon="mdi:arrow-down-bold", is_int=True,
+    )
+    surface.register_tunable_number(
+        thing="duck_release_ms",
+        name_suffix="Duck Release",
+        min_value=100, max_value=1000, step=50,
+        getter=lambda: int(state.duck_release_ms),
+        setter=_set_duck_release,
+        unit="ms", icon="mdi:arrow-up-bold", is_int=True,
+    )
+
+    def _set_heartbeat_interval(value: int) -> None:
+        hb = state.heartbeat
+        if hb is None:
+            return
+        hb.set_interval(int(value))
+
+    def _get_heartbeat_interval() -> int:
+        hb = state.heartbeat
+        return int(hb.interval_s) if hb is not None else 60
+
+    surface.register_tunable_number(
+        thing="heartbeat_interval_s",
+        name_suffix="Heartbeat Interval",
+        min_value=15, max_value=300, step=15,
+        getter=_get_heartbeat_interval,
+        setter=_set_heartbeat_interval,
+        unit="s", icon="mdi:heart-pulse", is_int=True,
+    )
 
 
 def _start_stage_e1_led(state: ServerState, loop: asyncio.AbstractEventLoop) -> None:

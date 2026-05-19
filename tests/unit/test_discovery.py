@@ -355,6 +355,129 @@ def test_state_publish_counter_records_within_window():
     assert counter.count() == 3
 
 
+def test_register_tunable_number_publishes_template_b_config():
+    surface, bridge = _make_surface()
+    value = {"x": 0.5}
+    surface.register_tunable_number(
+        thing="wake_sensitivity",
+        name_suffix="Wake Sensitivity",
+        min_value=0.1, max_value=0.9, step=0.05,
+        getter=lambda: value["x"],
+        setter=lambda v: value.__setitem__("x", v),
+    )
+    surface.publish_configs()
+    cfgs = _published_configs(bridge)
+    cfg = cfgs["calisto_lounge_wake_sensitivity"]
+    assert cfg["state_topic"] == "calisto/lounge/tunable/wake_sensitivity/state"
+    assert cfg["command_topic"] == "calisto/lounge/tunable/wake_sensitivity/set"
+    assert cfg["min"] == 0.1
+    assert cfg["max"] == 0.9
+    assert cfg["step"] == 0.05
+    assert cfg["mode"] == "slider"
+    assert cfg["value_template"] == "{{ value_json.value }}"
+
+
+def test_register_tunable_number_emits_state_on_publish_state():
+    surface, bridge = _make_surface()
+    value = {"x": 0.55}
+    surface.register_tunable_number(
+        thing="wake_sensitivity",
+        name_suffix="Wake Sensitivity",
+        min_value=0.1, max_value=0.9, step=0.05,
+        getter=lambda: value["x"],
+        setter=lambda v: value.__setitem__("x", v),
+    )
+    n = surface.publish_state()
+    assert n == 1
+    state_msgs = [(t, p) for t, p, _ in bridge.publishes if t == "calisto/lounge/tunable/wake_sensitivity/state"]
+    assert len(state_msgs) == 1
+    assert json.loads(state_msgs[0][1]) == {"value": 0.55}
+
+
+def test_register_tunable_number_clamps_and_invokes_setter():
+    surface, bridge = _make_surface()
+    value = {"x": 0.5}
+    surface.register_tunable_number(
+        thing="wake_sensitivity",
+        name_suffix="Wake Sensitivity",
+        min_value=0.1, max_value=0.9, step=0.05,
+        getter=lambda: value["x"],
+        setter=lambda v: value.__setitem__("x", v),
+    )
+
+    set_topic = "calisto/lounge/tunable/wake_sensitivity/set"
+    assert surface.route(set_topic, b'{"value": 0.42}') is True
+    assert value["x"] == pytest.approx(0.42)
+
+    # Clamps high.
+    assert surface.route(set_topic, b'{"value": 5.0}') is True
+    assert value["x"] == pytest.approx(0.9)
+    # Clamps low.
+    assert surface.route(set_topic, b'{"value": -1.0}') is True
+    assert value["x"] == pytest.approx(0.1)
+
+
+def test_register_tunable_number_int_cast():
+    surface, _bridge = _make_surface()
+    value = {"x": 30}
+    surface.register_tunable_number(
+        thing="duck_floor_pct",
+        name_suffix="Duck Floor",
+        min_value=10, max_value=80, step=5,
+        getter=lambda: value["x"],
+        setter=lambda v: value.__setitem__("x", v),
+        is_int=True,
+    )
+    surface.route("calisto/lounge/tunable/duck_floor_pct/set", b'{"value": 42.7}')
+    assert value["x"] == 43
+    assert isinstance(value["x"], int)
+
+
+def test_register_tunable_number_rejects_malformed_payloads():
+    surface, _bridge = _make_surface()
+    value = {"x": 0.5}
+    surface.register_tunable_number(
+        thing="wake_sensitivity",
+        name_suffix="Wake Sensitivity",
+        min_value=0.1, max_value=0.9, step=0.05,
+        getter=lambda: value["x"],
+        setter=lambda v: value.__setitem__("x", v),
+    )
+    set_topic = "calisto/lounge/tunable/wake_sensitivity/set"
+    surface.route(set_topic, b"not-json")
+    surface.route(set_topic, b'{"oops": 0.4}')
+    surface.route(set_topic, b'{"value": "nope"}')
+    assert value["x"] == 0.5  # unchanged
+
+
+def test_register_tunable_number_route_appears_in_subscriptions():
+    surface, _bridge = _make_surface()
+    surface.register_tunable_number(
+        thing="duck_attack_ms",
+        name_suffix="Duck Attack",
+        min_value=50, max_value=500, step=10,
+        getter=lambda: 150,
+        setter=lambda v: None,
+        is_int=True,
+    )
+    assert "calisto/lounge/tunable/duck_attack_ms/set" in surface.subscription_topics()
+
+
+def test_register_tunable_number_with_unit_in_payload():
+    surface, bridge = _make_surface()
+    surface.register_tunable_number(
+        thing="duck_floor_pct",
+        name_suffix="Duck Floor",
+        min_value=10, max_value=80, step=5,
+        getter=lambda: 30,
+        setter=lambda v: None,
+        unit="%", is_int=True,
+    )
+    surface.publish_configs()
+    cfgs = _published_configs(bridge)
+    assert cfgs["calisto_lounge_duck_floor_pct"]["unit_of_measurement"] == "%"
+
+
 def test_state_publish_counter_trims_outside_window(monkeypatch):
     counter = StatePublishCounter(window_s=60.0)
     base = [1000.0]

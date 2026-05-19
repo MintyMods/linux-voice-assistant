@@ -89,6 +89,15 @@ class HeartbeatPublisher:
     def bridge_reachable(self) -> bool:
         return self._bridge_reachable
 
+    @property
+    def interval_s(self) -> int:
+        return self._interval_s
+
+    def set_interval(self, value: int) -> None:
+        """Update the heartbeat cadence live (N.2 heartbeat_interval_s).
+        Takes effect after the next tick — the current sleep is honoured."""
+        self._interval_s = max(15, min(300, int(value)))
+
     # ------------------------------------------------------------------ API
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:

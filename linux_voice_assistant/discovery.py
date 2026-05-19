@@ -406,6 +406,10 @@ class EntitySurface:
         self.state = state
         self._tunable_state_emitters: List[Callable[[], None]] = []
         self._command_routes: Dict[str, Callable[[bytes], None]] = {}
+        # Extra Discovery configs registered by tunable rows. Each entry
+        # is (component, thing, payload-dict) added alongside the static
+        # read-only catalogue at publish_configs time.
+        self._tunable_configs: List[Tuple[str, str, Dict[str, Any]]] = []
 
     # ------------------------------------------------------------------ topics
 
@@ -533,10 +537,12 @@ class EntitySurface:
     # ------------------------------------------------------------------ publish
 
     def publish_configs(self) -> int:
-        """Publish every Discovery config in the static catalogue. Retained
-        + idempotent — safe to call on every (re)connect."""
+        """Publish every Discovery config in the static catalogue + every
+        registered tunable. Retained + idempotent — safe to call on every
+        (re)connect."""
         published = 0
-        for component, thing, payload in self._sensor_configs():
+        rows = list(self._sensor_configs()) + list(self._tunable_configs)
+        for component, thing, payload in rows:
             cfg_topic = self._config_topic(component, thing)
             if self.ha_bridge.publish(cfg_topic, json.dumps(payload), retain=True):
                 published += 1
@@ -586,3 +592,82 @@ class EntitySurface:
         except Exception:
             _LOGGER.exception("EntitySurface: handler for %s raised", topic)
         return True
+
+    # ------------------------------------------------------------- tunable API
+
+    def register_tunable_number(
+        self,
+        *,
+        thing: str,
+        name_suffix: str,
+        min_value: float,
+        max_value: float,
+        step: float,
+        getter: Callable[[], float],
+        setter: Callable[[float], None],
+        unit: Optional[str] = None,
+        icon: str = "mdi:tune",
+        mode: str = "slider",
+        is_int: bool = False,
+    ) -> None:
+        """Register a Template-B number tunable.
+
+        ``thing`` becomes the unique_id suffix and the tunable topic slug
+        (``calisto/<room>/tunable/<thing>/{state,set}``). ``getter``
+        returns the current backing value; ``setter`` receives the
+        clamped + cast value (int when ``is_int``, else float). The
+        surface owns clamping, JSON parsing, state echo, and route
+        dispatch — callers only describe + supply backing closures.
+        """
+        unique_id = f"calisto_{self.room}_{thing}"
+        state_topic = f"{STATE_TOPIC_PREFIX}/{self.room}/tunable/{thing}/state"
+        set_topic = f"{STATE_TOPIC_PREFIX}/{self.room}/tunable/{thing}/set"
+
+        payload: Dict[str, Any] = {
+            **self._common(thing, name_suffix),
+            "state_topic": state_topic,
+            "command_topic": set_topic,
+            "value_template": "{{ value_json.value }}",
+            "command_template": "{\"value\": {{ value }} }",
+            "min": min_value,
+            "max": max_value,
+            "step": step,
+            "mode": mode,
+            "icon": icon,
+        }
+        if unit:
+            payload["unit_of_measurement"] = unit
+        self._tunable_configs.append(("number", thing, payload))
+
+        def _emit_state() -> None:
+            current = getter()
+            value: Any = int(current) if is_int else float(current)
+            self.ha_bridge.publish(state_topic, json.dumps({"value": value}), retain=True)
+
+        self._tunable_state_emitters.append(_emit_state)
+
+        def _handle(raw: bytes) -> None:
+            try:
+                obj = json.loads(raw.decode("utf-8")) if raw else {}
+            except (ValueError, UnicodeDecodeError):
+                _LOGGER.warning("tunable %s/set: malformed payload %r", thing, raw[:80])
+                return
+            if not isinstance(obj, dict) or "value" not in obj:
+                _LOGGER.warning("tunable %s/set: payload missing 'value'", thing)
+                return
+            try:
+                raw_value = float(obj["value"])
+            except (TypeError, ValueError):
+                _LOGGER.warning("tunable %s/set: non-numeric value %r", thing, obj.get("value"))
+                return
+            clamped = max(min_value, min(max_value, raw_value))
+            applied: Any = int(round(clamped)) if is_int else clamped
+            try:
+                setter(applied)
+            except Exception:
+                _LOGGER.exception("tunable %s/set: setter raised; state echo skipped", thing)
+                return
+            _emit_state()
+            _LOGGER.info("tunable %s updated to %s", thing, applied)
+
+        self._command_routes[set_topic] = _handle
