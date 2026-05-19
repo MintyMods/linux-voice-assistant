@@ -133,7 +133,7 @@ class ServerState:
     generation: int = 0
     last_cancel_reason: Optional[str] = None
     last_cancel_ts: Optional[float] = None
-    room: str = "lounge"
+    room: str = "living_room"
     mqtt_client: Any = None
     mqtt_state_topic: Optional[str] = None
 

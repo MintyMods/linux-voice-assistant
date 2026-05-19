@@ -510,7 +510,7 @@ def _start_mqtt_cancel_subscriber(state: ServerState, loop: asyncio.AbstractEven
     if not host:
         _LOGGER.info("LVA_MQTT_HOST not set; voice-cancel MQTT subscriber disabled")
         return
-    room = os.environ.get("ROOM", "lounge")
+    room = os.environ.get("ROOM", "living_room")
     port = int(os.environ.get("LVA_MQTT_PORT", "1883"))
     username = os.environ.get("LVA_MQTT_USER") or None
     password = os.environ.get("LVA_MQTT_PASS") or None
@@ -620,7 +620,7 @@ def _start_stage_b_components(state: ServerState, loop: asyncio.AbstractEventLoo
     """
     import os
 
-    room = os.environ.get("ROOM", state.room or "lounge")
+    room = os.environ.get("ROOM", state.room or "living_room")
     state.room = room
 
     # MQTT broker resolution: M.5 form takes priority.
