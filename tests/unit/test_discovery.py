@@ -211,3 +211,164 @@ def test_handle_audible_notify_rejects_malformed():
     assert sv.handle_audible_notify_command(b"not-json") is False
     assert sv.handle_audible_notify_command(b'{"oops": true}') is False
     assert state.sv_audible_notify is True
+
+
+# ============================================================================
+# Stage G — EntitySurface + StatePublishCounter
+# ============================================================================
+
+
+from linux_voice_assistant.discovery import EntitySurface, StatePublishCounter
+
+
+class _FakeState:  # type: ignore[no-redef]
+    sv_threshold: float = 0.70
+    sv_audible_notify: bool = True
+
+
+def _make_surface() -> Tuple[EntitySurface, _FakeBridge]:
+    bridge = _FakeBridge()
+    state = _FakeState()
+    surface = EntitySurface(ha_bridge=bridge, room="lounge", state=state)
+    return surface, bridge
+
+
+def _published_configs(bridge: _FakeBridge):
+    """Return {component+thing: payload dict} for every Discovery config publish."""
+    out: dict = {}
+    for topic, payload, retain in bridge.publishes:
+        if not topic.startswith("homeassistant/"):
+            continue
+        # homeassistant/<component>/<unique_id>/config
+        parts = topic.split("/")
+        assert retain is True, f"Discovery config {topic} must be retained"
+        assert parts[-1] == "config"
+        unique_id = parts[-2]
+        out[unique_id] = json.loads(payload)
+    return out
+
+
+def test_publish_configs_emits_session_state_sensors():
+    surface, bridge = _make_surface()
+    n = surface.publish_configs()
+    assert n >= 3
+    cfgs = _published_configs(bridge)
+    state_cfg = cfgs["calisto_lounge_state"]
+    assert state_cfg["state_topic"] == "calisto/lounge/session/state"
+    assert state_cfg["value_template"] == "{{ value_json.state }}"
+    assert state_cfg["device"]["identifiers"] == ["calisto_lounge"]
+    assert state_cfg["availability_topic"] == "calisto/lounge/heartbeat"
+
+    gen_cfg = cfgs["calisto_lounge_generation"]
+    assert gen_cfg["value_template"] == "{{ value_json.generation }}"
+
+    cancel_cfg = cfgs["calisto_lounge_last_cancel_reason"]
+    assert "cancel_reason" in cancel_cfg["value_template"]
+
+
+def test_publish_configs_emits_connectivity_binary_sensors():
+    surface, bridge = _make_surface()
+    surface.publish_configs()
+    cfgs = _published_configs(bridge)
+
+    online = cfgs["calisto_lounge_online"]
+    assert online["state_topic"] == "calisto/lounge/heartbeat"
+    assert online["device_class"] == "connectivity"
+    assert online["expire_after"] == 300
+    assert online["payload_on"] == "online"
+    assert online["payload_off"] == "offline"
+
+    bridge_cfg = cfgs["calisto_lounge_bridge_reachable"]
+    assert bridge_cfg["device_class"] == "connectivity"
+    assert "bridge_reachable" in bridge_cfg["value_template"]
+
+
+def test_publish_configs_emits_per_channel_mpv_health():
+    surface, bridge = _make_surface()
+    surface.publish_configs()
+    cfgs = _published_configs(bridge)
+    for channel in ("tts", "chime", "media", "alarm"):
+        uid = f"calisto_lounge_mpv_{channel}_health"
+        assert uid in cfgs, f"missing {uid}"
+        assert cfgs[uid]["state_topic"] == "calisto/lounge/heartbeat"
+        assert channel in cfgs[uid]["value_template"]
+
+
+def test_publish_configs_emits_audio_health_aggregate():
+    surface, bridge = _make_surface()
+    surface.publish_configs()
+    cfgs = _published_configs(bridge)
+    audio = cfgs["calisto_lounge_audio_health"]
+    tmpl = audio["value_template"]
+    assert "dead" in tmpl
+    assert "degraded" in tmpl
+    assert "ok" in tmpl
+
+
+def test_publish_configs_emits_volume_sensor():
+    surface, bridge = _make_surface()
+    surface.publish_configs()
+    cfgs = _published_configs(bridge)
+    vol = cfgs["calisto_lounge_volume"]
+    assert vol["state_topic"] == "calisto/lounge/volume/state"
+    assert vol["unit_of_measurement"] == "%"
+
+
+def test_publish_configs_all_marked_retained():
+    surface, bridge = _make_surface()
+    surface.publish_configs()
+    for topic, _payload, retain in bridge.publishes:
+        assert retain is True, f"Discovery config {topic} must be retained"
+
+
+def test_publish_state_no_tunables_yet_returns_zero():
+    surface, _bridge = _make_surface()
+    assert surface.publish_state() == 0
+
+
+def test_subscription_topics_empty_in_read_only_commit():
+    surface, _bridge = _make_surface()
+    assert surface.subscription_topics() == []
+
+
+def test_route_returns_false_for_unknown_topic():
+    surface, _bridge = _make_surface()
+    assert surface.route("calisto/lounge/tunable/unknown/set", b"{}") is False
+
+
+def test_start_logs_and_does_not_raise():
+    surface, bridge = _make_surface()
+    surface.start()
+    # Configs published; no exception.
+    assert any(t.startswith("homeassistant/") for t, _p, _r in bridge.publishes)
+
+
+# -- StatePublishCounter ------------------------------------------------------
+
+
+def test_state_publish_counter_records_within_window():
+    counter = StatePublishCounter(window_s=60.0)
+    assert counter.count() == 0
+    counter.record()
+    counter.record()
+    counter.record()
+    assert counter.count() == 3
+
+
+def test_state_publish_counter_trims_outside_window(monkeypatch):
+    counter = StatePublishCounter(window_s=60.0)
+    base = [1000.0]
+
+    def fake_monotonic():
+        return base[0]
+
+    monkeypatch.setattr("linux_voice_assistant.discovery.time.monotonic", fake_monotonic)
+
+    counter.record()  # at t=1000
+    base[0] = 1059.0
+    counter.record()  # at t=1059, both still in window
+    assert counter.count() == 2
+    base[0] = 1061.0  # t=1061: first event (at 1000) is now outside 60s window
+    assert counter.count() == 1
+    base[0] = 1120.0  # both expired
+    assert counter.count() == 0

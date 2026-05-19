@@ -131,6 +131,13 @@ class HABridge:
         # Stage D — SV live-tunable discovery (publishes configs/state +
         # owns the command handlers for N.2 rows 143 + 153).
         self._sv_discovery: Any = None
+        # Stage G — N.2 static catalogue aggregator (read-only sensors +
+        # later commits add tunables). Owns its own dispatch table.
+        self._entity_surface: Any = None
+        # Stage G — H4 telemetry: rolling 60s count of K.1 state publishes.
+        # Wired by EntitySurface when the state_publishes_per_min sensor
+        # is added; HABridge.publish_state increments lazily via record().
+        self._state_publish_counter: Any = None
 
     def _lwt_payload(self) -> str:
         return json.dumps(
@@ -247,6 +254,20 @@ class HABridge:
                     sv_disco.publish_state()
                 except Exception:
                     _LOGGER.exception("HABridge: SV discovery republish on connect raised")
+            # Stage G — N.2 static catalogue + its tunable subscriptions.
+            surface = self._entity_surface
+            if surface is not None:
+                try:
+                    surface.publish_configs()
+                    surface.publish_state()
+                except Exception:
+                    _LOGGER.exception("HABridge: EntitySurface republish on connect raised")
+                try:
+                    extra = surface.subscription_topics()
+                    if extra:
+                        _c.subscribe([(t, 1) for t in extra])
+                except Exception:
+                    _LOGGER.exception("HABridge: EntitySurface subscribe raised")
         else:
             _LOGGER.error("HABridge connect failed rc=%s", rc)
 
@@ -299,6 +320,13 @@ class HABridge:
             client.publish(self.state_topic, json.dumps(payload), qos=1, retain=True)
         except Exception:
             _LOGGER.exception("HABridge.publish_state failed for topic %s", self.state_topic)
+
+        counter = self._state_publish_counter
+        if counter is not None:
+            try:
+                counter.record()
+            except Exception:
+                _LOGGER.exception("HABridge: state_publish_counter.record raised")
 
         # B3 stop-gap LED mirror — the v0 calisto-led service consumes:
         #   wake|processing|complete|off|error  on calisto/<room>/led/set.
@@ -392,6 +420,17 @@ def _on_message(self: HABridge, _client: Any, _userdata: Any, msg: Any) -> None:
             request_id=obj.get("request_id"),
         )
         return
+
+    # Stage G — EntitySurface dispatch table. Any tunable registered via
+    # `EntitySurface.register_tunable_*` is routed here. Returning True
+    # means the surface owned the message; we stop dispatching.
+    surface = self._entity_surface
+    if surface is not None:
+        try:
+            if surface.route(topic, raw_payload):
+                return
+        except Exception:
+            _LOGGER.exception("HABridge: EntitySurface.route raised")
 
     # Stage D — SV live-tunable command routes. Each command handler
     # mutates state, persists to enrollments (threshold only), and
@@ -645,12 +684,28 @@ def _attach_speaker_verifier_discovery(self: HABridge, discovery: Any) -> None:
     self._sv_discovery = discovery
 
 
+def _attach_entity_surface(self: HABridge, surface: Any) -> None:
+    """Wire the Stage G N.2 static catalogue aggregator. Republished on
+    every (re)connect; subscribes the surface's tunable command topics;
+    routes them through ``surface.route()``."""
+    self._entity_surface = surface
+
+
+def _attach_state_publish_counter(self: HABridge, counter: Any) -> None:
+    """Wire the rolling 60s state-publish counter. publish_state will
+    invoke counter.record() on every emit so the N.2
+    ``state_publishes_per_min`` sensor can publish the window count."""
+    self._state_publish_counter = counter
+
+
 HABridge.attach_led_controller = _attach_led_controller  # type: ignore[attr-defined]
 HABridge.attach_audio_controllers = _attach_audio_controllers  # type: ignore[attr-defined]
 HABridge.attach_cancel_coordinator = _attach_cancel_coordinator  # type: ignore[attr-defined]
 HABridge.attach_restart_hook = _attach_restart_hook  # type: ignore[attr-defined]
 HABridge.attach_enrollment_handler = _attach_enrollment_handler  # type: ignore[attr-defined]
 HABridge.attach_speaker_verifier_discovery = _attach_speaker_verifier_discovery  # type: ignore[attr-defined]
+HABridge.attach_entity_surface = _attach_entity_surface  # type: ignore[attr-defined]
+HABridge.attach_state_publish_counter = _attach_state_publish_counter  # type: ignore[attr-defined]
 HABridge._on_message = _on_message  # type: ignore[attr-defined]
 HABridge._route_say = _route_say  # type: ignore[attr-defined]
 HABridge.publish_volume_state = _publish_volume_state  # type: ignore[attr-defined]

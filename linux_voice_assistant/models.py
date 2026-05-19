@@ -192,6 +192,11 @@ class ServerState:
     sv_enabled: bool = True
     sv_audible_notify: bool = True
     sv_threshold: float = 0.70
+    # Stage G — N.2 static catalogue aggregator (read-only sensors + later
+    # commits add tunables). Wired in `_start_stage_b_components` after
+    # HABridge + SpeakerVerifierDiscovery so reconnect-republish ordering
+    # is deterministic.
+    entity_surface: Any = None
     # Wake-fire timestamps in monotonic seconds, retained for rolling
     # 5-minute counters in the K.2 heartbeat. Bounded by trim-on-append.
     wake_events: Any = field(default_factory=list)

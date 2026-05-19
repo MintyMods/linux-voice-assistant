@@ -35,7 +35,7 @@ from .mpv_player import MpvMediaPlayer
 from .satellite import VoiceSatelliteProtocol
 from .session import DeviceSession
 from .tts_output import TTSOutput
-from .discovery import SpeakerVerifierDiscovery, WakeCaptureDiscovery
+from .discovery import EntitySurface, SpeakerVerifierDiscovery, WakeCaptureDiscovery
 from .wake_capture import WakeCapture
 from .wake_capture_http import WakeCaptureHTTP
 from .util import (
@@ -919,6 +919,20 @@ def _start_stage_b_components(state: ServerState, loop: asyncio.AbstractEventLoo
             state.speaker_verifier_discovery = sv_discovery
         except Exception:
             _LOGGER.exception("Stage D: SpeakerVerifierDiscovery construction failed")
+
+        # Stage G — N.2 static per-room catalogue. Read-only sensors mirror
+        # session/state + heartbeat; tunables registered in later commits.
+        try:
+            entity_surface = EntitySurface(
+                ha_bridge=ha_bridge,
+                room=room,
+                state=state,
+            )
+            ha_bridge.attach_entity_surface(entity_surface)
+            entity_surface.start()
+            state.entity_surface = entity_surface
+        except Exception:
+            _LOGGER.exception("Stage G: EntitySurface construction failed")
 
 
 def _start_stage_e1_led(state: ServerState, loop: asyncio.AbstractEventLoop) -> None:
