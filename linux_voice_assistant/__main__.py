@@ -35,7 +35,7 @@ from .mpv_player import MpvMediaPlayer
 from .satellite import VoiceSatelliteProtocol
 from .session import DeviceSession
 from .tts_output import TTSOutput
-from .discovery import EntitySurface, SpeakerVerifierDiscovery, WakeCaptureDiscovery
+from .discovery import EntitySurface, SpeakerVerifierDiscovery, StatePublishCounter, WakeCaptureDiscovery
 from .wake_capture import WakeCapture
 from .wake_capture_http import WakeCaptureHTTP
 from .util import (
@@ -922,7 +922,14 @@ def _start_stage_b_components(state: ServerState, loop: asyncio.AbstractEventLoo
 
         # Stage G — N.2 static per-room catalogue. Read-only sensors mirror
         # session/state + heartbeat; tunables (numbers / switches / select /
-        # button) are registered below.
+        # button) are registered below. Counter feeds the H4
+        # state_publishes_per_min telemetry through the heartbeat payload.
+        try:
+            state.state_publish_counter = StatePublishCounter()
+            ha_bridge.attach_state_publish_counter(state.state_publish_counter)
+        except Exception:
+            _LOGGER.exception("Stage G: StatePublishCounter wiring failed")
+
         try:
             entity_surface = EntitySurface(
                 ha_bridge=ha_bridge,
@@ -1029,6 +1036,70 @@ def _register_stage_g_tunables(surface: "EntitySurface", state: "ServerState") -
         getter=_get_heartbeat_interval,
         setter=_set_heartbeat_interval,
         unit="s", icon="mdi:heart-pulse", is_int=True,
+    )
+
+    # Top-level audible_notify (E6 ChimeController gate). Distinct from
+    # sv_audible_notify (D2) which gates the post-wake rejection chime.
+    def _get_audible_notify() -> bool:
+        arbiter = state.audible_notify_arbiter
+        return bool(getattr(arbiter, "enabled", True)) if arbiter is not None else True
+
+    def _set_audible_notify(value: bool) -> None:
+        arbiter = state.audible_notify_arbiter
+        if arbiter is not None:
+            arbiter.enabled = bool(value)
+
+    surface.register_tunable_switch(
+        thing="audible_notify",
+        name_suffix="Audible Notify",
+        getter=_get_audible_notify,
+        setter=_set_audible_notify,
+        icon="mdi:bell-ring",
+    )
+
+    # Mute: command topic + state topic are owned by LedController +
+    # HABridge.publish_mute_state. EntitySurface only publishes the
+    # Discovery config so the entity appears on the dashboard.
+    surface.register_passthrough_switch(
+        thing="mute",
+        name_suffix="Mute",
+        state_topic=f"calisto/{state.room}/mute/state",
+        set_topic=f"calisto/{state.room}/mute/set",
+        payload_on="on",
+        payload_off="off",
+        icon="mdi:microphone-off",
+    )
+
+    # Alarm ringtone select. Options enumerated from the sound library on
+    # this host; falls back to the current state value when the library
+    # is empty so HA always has at least one valid option.
+    from .audible_notify import list_alarm_ringtones
+    ringtone_options = list_alarm_ringtones()
+    if not ringtone_options:
+        ringtone_options = [state.alarm_ringtone]
+    if state.alarm_ringtone not in ringtone_options:
+        ringtone_options = [state.alarm_ringtone] + ringtone_options
+
+    def _set_alarm_ringtone(value: str) -> None:
+        state.alarm_ringtone = value
+
+    surface.register_tunable_select(
+        thing="alarm_ringtone",
+        name_suffix="Alarm Ringtone",
+        options=ringtone_options,
+        getter=lambda: state.alarm_ringtone,
+        setter=_set_alarm_ringtone,
+        icon="mdi:music-note",
+    )
+
+    # I2 dashboard cancel button — publishes the K.3 cancel payload that
+    # CancelCoordinator (already subscribed) parses and acts on.
+    surface.register_button(
+        thing="stop",
+        name_suffix="Stop",
+        command_topic=f"calisto/{state.room}/cancel",
+        press_payload="{\"reason\":\"DASHBOARD\",\"source\":\"ha_dashboard\"}",
+        icon="mdi:stop-circle",
     )
 
 

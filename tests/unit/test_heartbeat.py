@@ -42,9 +42,42 @@ def test_payload_has_all_k2_keys():
     required = {
         "ts", "uptime_s", "state", "generation", "bridge_reachable",
         "mic_active", "hidraw_ok", "mpv_channels", "wake_count_5m",
-        "cancel_count_5m", "subsystems",
+        "cancel_count_5m", "state_publishes_per_min", "subsystems",
     }
     assert required.issubset(set(payload.keys()))
+
+
+def test_state_publishes_per_min_reads_counter_from_state():
+    from linux_voice_assistant.discovery import StatePublishCounter
+
+    state = make_server_state()
+    counter = StatePublishCounter()
+    counter.record()
+    counter.record()
+    counter.record()
+    state.state_publish_counter = counter
+
+    pub, ha, _ = _publisher(state=state)
+    pub.publish_once()
+    payload = _payload_of(ha)
+    assert payload["state_publishes_per_min"] == 3
+
+
+def test_state_publishes_per_min_defaults_to_zero_without_counter():
+    pub, ha, _ = _publisher()
+    pub.publish_once()
+    payload = _payload_of(ha)
+    assert payload["state_publishes_per_min"] == 0
+
+
+def test_heartbeat_set_interval_clamps_to_range():
+    pub, _ha, _ = _publisher()
+    pub.set_interval(120)
+    assert pub.interval_s == 120
+    pub.set_interval(10)        # below 15
+    assert pub.interval_s == 15
+    pub.set_interval(500)       # above 300
+    assert pub.interval_s == 300
 
 
 def test_topic_uses_room():

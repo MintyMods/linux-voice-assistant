@@ -197,6 +197,16 @@ class ServerState:
     # HABridge + SpeakerVerifierDiscovery so reconnect-republish ordering
     # is deterministic.
     entity_surface: Any = None
+    # Stage G — H4 telemetry. HABridge.publish_state increments this on
+    # every K.1 emit; HeartbeatPublisher reads it into the heartbeat
+    # payload for the `state_publishes_per_min` sensor.
+    state_publish_counter: Any = None
+    # Stage G — alarm ringtone selection (N.2 select). Stored on state so
+    # the AlarmController can read it as the default ringtone when K.8
+    # payloads omit it. Value is a sound-library slug (e.g.
+    # "Alarm clock.ogg") — resolution happens at play-time via
+    # `resolve_alarm_sound`.
+    alarm_ringtone: str = "Alarm clock.ogg"
     # Wake-fire timestamps in monotonic seconds, retained for rolling
     # 5-minute counters in the K.2 heartbeat. Bounded by trim-on-append.
     wake_events: Any = field(default_factory=list)

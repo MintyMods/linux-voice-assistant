@@ -463,6 +463,155 @@ def test_register_tunable_number_route_appears_in_subscriptions():
     assert "calisto/lounge/tunable/duck_attack_ms/set" in surface.subscription_topics()
 
 
+def test_publish_configs_includes_state_publishes_per_min_sensor():
+    surface, bridge = _make_surface()
+    surface.publish_configs()
+    cfgs = _published_configs(bridge)
+    spm = cfgs["calisto_lounge_state_publishes_per_min"]
+    assert spm["state_topic"] == "calisto/lounge/heartbeat"
+    assert "state_publishes_per_min" in spm["value_template"]
+    assert spm["unit_of_measurement"] == "/min"
+
+
+def test_register_tunable_switch_template_c_json_envelope():
+    surface, bridge = _make_surface()
+    value = {"x": True}
+    surface.register_tunable_switch(
+        thing="audible_notify",
+        name_suffix="Audible Notify",
+        getter=lambda: value["x"],
+        setter=lambda v: value.__setitem__("x", v),
+    )
+    surface.publish_configs()
+    cfgs = _published_configs(bridge)
+    cfg = cfgs["calisto_lounge_audible_notify"]
+    assert cfg["payload_on"] == "{\"value\": true}"
+    assert cfg["payload_off"] == "{\"value\": false}"
+    assert cfg["state_on"] is True
+    assert cfg["state_off"] is False
+    assert cfg["value_template"] == "{{ value_json.value }}"
+
+
+def test_register_tunable_switch_handles_set_command():
+    surface, bridge = _make_surface()
+    value = {"x": True}
+    surface.register_tunable_switch(
+        thing="audible_notify",
+        name_suffix="Audible Notify",
+        getter=lambda: value["x"],
+        setter=lambda v: value.__setitem__("x", v),
+    )
+    set_topic = "calisto/lounge/tunable/audible_notify/set"
+    assert surface.route(set_topic, b'{"value": false}') is True
+    assert value["x"] is False
+
+    # String coercion
+    surface.route(set_topic, b'{"value": "on"}')
+    assert value["x"] is True
+    surface.route(set_topic, b'{"value": "off"}')
+    assert value["x"] is False
+
+    # Malformed silently rejected
+    surface.route(set_topic, b"not-json")
+    surface.route(set_topic, b'{"oops": true}')
+    assert value["x"] is False  # unchanged
+
+
+def test_register_tunable_switch_emits_state():
+    surface, bridge = _make_surface()
+    value = {"x": False}
+    surface.register_tunable_switch(
+        thing="audible_notify",
+        name_suffix="Audible Notify",
+        getter=lambda: value["x"],
+        setter=lambda v: value.__setitem__("x", v),
+    )
+    surface.publish_state()
+    state_msgs = [(t, p) for t, p, _ in bridge.publishes if t == "calisto/lounge/tunable/audible_notify/state"]
+    assert len(state_msgs) == 1
+    assert json.loads(state_msgs[0][1]) == {"value": False}
+
+
+def test_register_passthrough_switch_publishes_config_only():
+    surface, bridge = _make_surface()
+    surface.register_passthrough_switch(
+        thing="mute",
+        name_suffix="Mute",
+        state_topic="calisto/lounge/mute/state",
+        set_topic="calisto/lounge/mute/set",
+    )
+    surface.publish_configs()
+    cfgs = _published_configs(bridge)
+    cfg = cfgs["calisto_lounge_mute"]
+    assert cfg["state_topic"] == "calisto/lounge/mute/state"
+    assert cfg["command_topic"] == "calisto/lounge/mute/set"
+    assert cfg["payload_on"] == "on"
+    assert cfg["payload_off"] == "off"
+    # value_template intentionally absent — state is a plain string.
+    assert "value_template" not in cfg
+
+    # No subscription claimed; no state emitter; no route owned.
+    assert "calisto/lounge/mute/set" not in surface.subscription_topics()
+    assert surface.publish_state() == 0
+    assert surface.route("calisto/lounge/mute/set", b"on") is False
+
+
+def test_register_tunable_select_template_d():
+    surface, bridge = _make_surface()
+    value = {"x": "Alarm clock.ogg"}
+    surface.register_tunable_select(
+        thing="alarm_ringtone",
+        name_suffix="Alarm Ringtone",
+        options=["Alarm clock.ogg", "Beep.ogg", "Ringer.ogg"],
+        getter=lambda: value["x"],
+        setter=lambda v: value.__setitem__("x", v),
+    )
+    surface.publish_configs()
+    cfgs = _published_configs(bridge)
+    cfg = cfgs["calisto_lounge_alarm_ringtone"]
+    assert cfg["options"] == ["Alarm clock.ogg", "Beep.ogg", "Ringer.ogg"]
+    assert cfg["command_template"] == "{\"value\": \"{{ value }}\"}"
+
+
+def test_register_tunable_select_rejects_unknown_option():
+    surface, _bridge = _make_surface()
+    value = {"x": "Alarm clock.ogg"}
+    surface.register_tunable_select(
+        thing="alarm_ringtone",
+        name_suffix="Alarm Ringtone",
+        options=["Alarm clock.ogg", "Beep.ogg"],
+        getter=lambda: value["x"],
+        setter=lambda v: value.__setitem__("x", v),
+    )
+    set_topic = "calisto/lounge/tunable/alarm_ringtone/set"
+
+    # Valid option accepted.
+    surface.route(set_topic, b'{"value": "Beep.ogg"}')
+    assert value["x"] == "Beep.ogg"
+
+    # Unknown option rejected.
+    surface.route(set_topic, b'{"value": "Tubular.ogg"}')
+    assert value["x"] == "Beep.ogg"  # unchanged
+
+
+def test_register_button_publishes_config():
+    surface, bridge = _make_surface()
+    surface.register_button(
+        thing="stop",
+        name_suffix="Stop",
+        command_topic="calisto/lounge/cancel",
+        press_payload='{"reason":"DASHBOARD","source":"ha_dashboard"}',
+    )
+    surface.publish_configs()
+    cfgs = _published_configs(bridge)
+    btn = cfgs["calisto_lounge_stop"]
+    assert btn["command_topic"] == "calisto/lounge/cancel"
+    assert btn["payload_press"] == '{"reason":"DASHBOARD","source":"ha_dashboard"}'
+    assert "availability_template" not in btn  # buttons don't need it
+    # Button doesn't claim a subscription (LVA already subscribes to cancel).
+    assert "calisto/lounge/cancel" not in surface.subscription_topics()
+
+
 def test_register_tunable_number_with_unit_in_payload():
     surface, bridge = _make_surface()
     surface.register_tunable_number(

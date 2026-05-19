@@ -82,6 +82,26 @@ def resolve_chime_sound(name: Optional[str]) -> Optional[str]:
     return _resolve_in_dirs(name, _candidate_dirs("CHIME_SOUNDS_DIR", _DEFAULT_CHIME_DIRS))
 
 
+def list_alarm_ringtones() -> list:
+    """Return a deduplicated, sorted list of alarm ringtone slugs available
+    on this host. Honoured by ``ALARM_SOUNDS_DIR`` plus the
+    ``_DEFAULT_ALARM_DIRS`` fallbacks. Caller (Stage G N.2 select) uses the
+    list as the HA select options.
+
+    On a fresh host with no alarm library installed, returns an empty
+    list — the caller is expected to fall back to a sensible default
+    rather than block startup."""
+    found = set()
+    for d in _candidate_dirs("ALARM_SOUNDS_DIR", _DEFAULT_ALARM_DIRS):
+        try:
+            for entry in Path(d).iterdir():
+                if entry.is_file() and entry.suffix.lower() in (".ogg", ".wav", ".mp3", ".flac"):
+                    found.add(entry.name)
+        except (FileNotFoundError, NotADirectoryError, PermissionError):
+            continue
+    return sorted(found)
+
+
 def resolve_alarm_sound(name: Optional[str]) -> str:
     """Map an alarm slug to a path. Falls back through:
 

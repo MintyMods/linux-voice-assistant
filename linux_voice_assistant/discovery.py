@@ -532,6 +532,20 @@ class EntitySurface:
              "unit_of_measurement": "%"},
         ))
 
+        # H4 telemetry — rolling 60s count of K.1 state-publish events.
+        # HABridge.publish_state increments the StatePublishCounter; the
+        # current count is folded into the heartbeat payload by
+        # HeartbeatPublisher._build_payload so this sensor reads it as a
+        # heartbeat field rather than needing its own publish loop.
+        configs.append((
+            "sensor", "state_publishes_per_min",
+            {**self._common("state_publishes_per_min", "State Publishes per Minute"),
+             "state_topic": self.heartbeat_topic,
+             "value_template": "{{ value_json.state_publishes_per_min | default(0) }}",
+             "icon": "mdi:swap-vertical",
+             "unit_of_measurement": "/min"},
+        ))
+
         return configs
 
     # ------------------------------------------------------------------ publish
@@ -671,3 +685,172 @@ class EntitySurface:
             _LOGGER.info("tunable %s updated to %s", thing, applied)
 
         self._command_routes[set_topic] = _handle
+
+    def register_tunable_switch(
+        self,
+        *,
+        thing: str,
+        name_suffix: str,
+        getter: Callable[[], bool],
+        setter: Callable[[bool], None],
+        icon: str = "mdi:toggle-switch",
+    ) -> None:
+        """Register a Template-C switch with the JSON-envelope payload
+        shape used throughout the v1 tunable surface
+        (`{"value": true|false}`). Owns its own command + state topics."""
+        unique_id = f"calisto_{self.room}_{thing}"
+        state_topic = f"{STATE_TOPIC_PREFIX}/{self.room}/tunable/{thing}/state"
+        set_topic = f"{STATE_TOPIC_PREFIX}/{self.room}/tunable/{thing}/set"
+
+        payload: Dict[str, Any] = {
+            **self._common(thing, name_suffix),
+            "state_topic": state_topic,
+            "command_topic": set_topic,
+            "value_template": "{{ value_json.value }}",
+            "payload_on": "{\"value\": true}",
+            "payload_off": "{\"value\": false}",
+            "state_on": True,
+            "state_off": False,
+            "icon": icon,
+        }
+        self._tunable_configs.append(("switch", thing, payload))
+
+        def _emit_state() -> None:
+            current = bool(getter())
+            self.ha_bridge.publish(state_topic, json.dumps({"value": current}), retain=True)
+
+        self._tunable_state_emitters.append(_emit_state)
+
+        def _handle(raw: bytes) -> None:
+            try:
+                obj = json.loads(raw.decode("utf-8")) if raw else {}
+            except (ValueError, UnicodeDecodeError):
+                _LOGGER.warning("tunable %s/set: malformed payload %r", thing, raw[:80])
+                return
+            if not isinstance(obj, dict) or "value" not in obj:
+                _LOGGER.warning("tunable %s/set: payload missing 'value'", thing)
+                return
+            value = obj["value"]
+            if isinstance(value, str):
+                normalized = value.strip().lower() in ("true", "1", "on", "yes")
+            else:
+                normalized = bool(value)
+            try:
+                setter(normalized)
+            except Exception:
+                _LOGGER.exception("tunable %s/set: setter raised", thing)
+                return
+            _emit_state()
+            _LOGGER.info("tunable %s updated to %s", thing, normalized)
+
+        self._command_routes[set_topic] = _handle
+
+    def register_passthrough_switch(
+        self,
+        *,
+        thing: str,
+        name_suffix: str,
+        state_topic: str,
+        set_topic: str,
+        payload_on: str = "on",
+        payload_off: str = "off",
+        icon: str = "mdi:toggle-switch",
+    ) -> None:
+        """Register a Template-C switch whose command topic is owned by
+        another in-process subscriber (e.g. mute → LedController.set_private).
+
+        Publishes only the Discovery config — no state emitter (the owning
+        component already publishes the retained state topic), no route
+        (HABridge dispatches the set topic to its existing handler).
+        """
+        payload: Dict[str, Any] = {
+            **self._common(thing, name_suffix),
+            "state_topic": state_topic,
+            "command_topic": set_topic,
+            "payload_on": payload_on,
+            "payload_off": payload_off,
+            "state_on": payload_on,
+            "state_off": payload_off,
+            "icon": icon,
+        }
+        self._tunable_configs.append(("switch", thing, payload))
+
+    def register_tunable_select(
+        self,
+        *,
+        thing: str,
+        name_suffix: str,
+        options: List[str],
+        getter: Callable[[], str],
+        setter: Callable[[str], None],
+        icon: str = "mdi:music-note",
+    ) -> None:
+        """Register a Template-D select. JSON-envelope payload to match
+        the rest of the v1 surface; HA enforces the `options` list."""
+        unique_id = f"calisto_{self.room}_{thing}"
+        state_topic = f"{STATE_TOPIC_PREFIX}/{self.room}/tunable/{thing}/state"
+        set_topic = f"{STATE_TOPIC_PREFIX}/{self.room}/tunable/{thing}/set"
+
+        payload: Dict[str, Any] = {
+            **self._common(thing, name_suffix),
+            "state_topic": state_topic,
+            "command_topic": set_topic,
+            "value_template": "{{ value_json.value }}",
+            "command_template": "{\"value\": \"{{ value }}\"}",
+            "options": list(options),
+            "icon": icon,
+        }
+        self._tunable_configs.append(("select", thing, payload))
+
+        def _emit_state() -> None:
+            current = str(getter())
+            self.ha_bridge.publish(state_topic, json.dumps({"value": current}), retain=True)
+
+        self._tunable_state_emitters.append(_emit_state)
+
+        def _handle(raw: bytes) -> None:
+            try:
+                obj = json.loads(raw.decode("utf-8")) if raw else {}
+            except (ValueError, UnicodeDecodeError):
+                _LOGGER.warning("tunable %s/set: malformed payload %r", thing, raw[:80])
+                return
+            if not isinstance(obj, dict) or "value" not in obj:
+                _LOGGER.warning("tunable %s/set: payload missing 'value'", thing)
+                return
+            value = str(obj["value"])
+            if options and value not in options:
+                _LOGGER.warning("tunable %s/set: %r not in options", thing, value)
+                return
+            try:
+                setter(value)
+            except Exception:
+                _LOGGER.exception("tunable %s/set: setter raised", thing)
+                return
+            _emit_state()
+            _LOGGER.info("tunable %s updated to %s", thing, value)
+
+        self._command_routes[set_topic] = _handle
+
+    def register_button(
+        self,
+        *,
+        thing: str,
+        name_suffix: str,
+        command_topic: str,
+        press_payload: str,
+        icon: str = "mdi:gesture-tap-button",
+    ) -> None:
+        """Register a Template-E button. Publishes Discovery config only;
+        HA presses send ``press_payload`` directly to ``command_topic``
+        (no LVA-side state)."""
+        payload: Dict[str, Any] = {
+            **self._common(thing, name_suffix),
+            "command_topic": command_topic,
+            "payload_press": press_payload,
+            "icon": icon,
+        }
+        # Buttons don't have availability_template — payload_press fires
+        # regardless, and HA's availability_topic alone (set via _common)
+        # handles online/offline. Remove the template that doesn't apply.
+        payload.pop("availability_template", None)
+        self._tunable_configs.append(("button", thing, payload))

@@ -217,8 +217,18 @@ class HeartbeatPublisher:
             "mpv_channels": self._mpv_channel_health(),
             "wake_count_5m": self._wake_count_5m(now),
             "cancel_count_5m": self._cancel_count_5m(),
+            "state_publishes_per_min": self._state_publishes_per_min(),
             "subsystems": self._subsystem_health(mic_active, hidraw_ok),
         }
+
+    def _state_publishes_per_min(self) -> int:
+        counter = getattr(self._state, "state_publish_counter", None)
+        if counter is None:
+            return 0
+        try:
+            return int(counter.count())
+        except Exception:
+            return 0
 
     def _mpv_channel_health(self) -> dict:
         """Per-channel mpv health: ok | degraded | dead.
