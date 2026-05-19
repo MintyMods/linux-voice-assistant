@@ -542,6 +542,9 @@ def test_on_connect_subscribes_to_all_back_compat_topics(fake_paho):
         bridge.admin_restart_topic,
         # Stage D — speaker enrollment trigger.
         bridge.enroll_capture_topic,
+        # Stage D — SV live tunables (N.2 rows 143 + 153).
+        bridge.sv_threshold_set_topic,
+        bridge.sv_audible_notify_set_topic,
     }
     # All at QoS 1.
     qos_values = {qos for _t, qos in fake.subscriptions}

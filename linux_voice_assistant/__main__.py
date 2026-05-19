@@ -35,7 +35,7 @@ from .mpv_player import MpvMediaPlayer
 from .satellite import VoiceSatelliteProtocol
 from .session import DeviceSession
 from .tts_output import TTSOutput
-from .discovery import WakeCaptureDiscovery
+from .discovery import SpeakerVerifierDiscovery, WakeCaptureDiscovery
 from .wake_capture import WakeCapture
 from .wake_capture_http import WakeCaptureHTTP
 from .util import (
@@ -906,6 +906,19 @@ def _start_stage_b_components(state: ServerState, loop: asyncio.AbstractEventLoo
             ha_bridge.attach_enrollment_handler(enrollment_handler)
         except Exception:
             _LOGGER.exception("Stage D: ha_bridge.attach_enrollment_handler raised")
+
+        try:
+            sv_discovery = SpeakerVerifierDiscovery(
+                ha_bridge=ha_bridge,
+                state=state,
+                enrollments=enrollments,
+                room=room,
+            )
+            ha_bridge.attach_speaker_verifier_discovery(sv_discovery)
+            sv_discovery.start()
+            state.speaker_verifier_discovery = sv_discovery
+        except Exception:
+            _LOGGER.exception("Stage D: SpeakerVerifierDiscovery construction failed")
 
 
 def _start_stage_e1_led(state: ServerState, loop: asyncio.AbstractEventLoop) -> None:

@@ -1,23 +1,16 @@
-"""Stage C — minimal MQTT Discovery surface for wake-capture stats sensors.
+"""Stage C / D — MQTT Discovery surface.
 
-Publishes HA Discovery config payloads (retained) for the metrics that the
-triage dashboard binds to:
+Module hosts every Discovery publisher per N (HA MQTT Discovery manifest):
 
-  - sensor.calisto_<room>_wake_captures_24h          (total wake fires / day)
-  - sensor.calisto_<room>_wake_positives_24h         (label=positive)
-  - sensor.calisto_<room>_wake_negatives_24h         (label=negative)
-  - sensor.calisto_<room>_wake_ambiguous_24h         (label=ambiguous)
-  - sensor.calisto_<room>_wake_gate2_rejects_24h     (Stage D Gate-2 rejects)
-  - sensor.calisto_<room>_wake_pending_triage        (label is null OR ambiguous)
-  - sensor.calisto_<room>_wake_capture_http_url      (URL prefix HA's REST hits)
+  Stage C — wake-capture stats sensors (``WakeCaptureDiscovery``).
+  Stage D — speaker-verification live tunables (``SpeakerVerifierDiscovery``):
+    - number.calisto_<room>_sv_threshold      (Template B, 0.40–0.90 step 0.01)
+    - switch.calisto_<room>_sv_audible_notify (Template C, boolean)
 
-The full N.2 Discovery manifest (every voice entity per room) lands in
-Stage G; this module is the earliest Discovery surface and will be expanded
-in-place rather than rewritten. State updates are pushed every 60s while the
-LVA process is up.
-
-All publishes go through ``HABridge.publish`` so we share a single MQTT
-client until ``mqtt_router`` consolidates in Stage F.
+The full N.2 manifest (every voice entity per room) lands incrementally —
+publishers are added to this module rather than scattered. All publishes go
+through ``HABridge.publish`` so we share a single MQTT client; mqtt_router
+(K.15) owns the subscription matrix.
 """
 
 from __future__ import annotations
@@ -153,3 +146,193 @@ class WakeCaptureDiscovery:
                 raise
             except Exception:
                 _LOGGER.exception("Discovery state publish raised; continuing")
+
+
+# ---------------------------------------------------------------------------
+# Stage D — SpeakerVerifier live-tunables (N.2 entries 143 + 153)
+# ---------------------------------------------------------------------------
+
+
+# N.2 row 143 — number, range / step locked by spec.
+SV_THRESHOLD_MIN = 0.40
+SV_THRESHOLD_MAX = 0.90
+SV_THRESHOLD_STEP = 0.01
+
+
+class SpeakerVerifierDiscovery:
+    """Publishes the two SV live-tunable HA entities + routes their command
+    topics back into ServerState / EnrollmentsStore.
+
+    Unlike WakeCaptureDiscovery there is no periodic publish loop — state
+    only changes when HA writes a new value, so we publish state on
+    startup + on every accepted command. Discovery configs are republished
+    on every MQTT (re)connect via ``HABridge.attach_speaker_verifier_discovery``.
+    """
+
+    def __init__(
+        self,
+        *,
+        ha_bridge: Any,
+        state: Any,
+        enrollments: Any,
+        room: str,
+    ) -> None:
+        self.ha_bridge = ha_bridge
+        self.state = state
+        self.enrollments = enrollments
+        self.room = room
+
+    # ---- topics ----
+
+    @property
+    def threshold_state_topic(self) -> str:
+        return f"{STATE_TOPIC_PREFIX}/{self.room}/tunable/sv_threshold/state"
+
+    @property
+    def threshold_set_topic(self) -> str:
+        return f"{STATE_TOPIC_PREFIX}/{self.room}/tunable/sv_threshold/set"
+
+    @property
+    def audible_notify_state_topic(self) -> str:
+        return f"{STATE_TOPIC_PREFIX}/{self.room}/tunable/sv_audible_notify/state"
+
+    @property
+    def audible_notify_set_topic(self) -> str:
+        return f"{STATE_TOPIC_PREFIX}/{self.room}/tunable/sv_audible_notify/set"
+
+    @property
+    def availability_topic(self) -> str:
+        return f"{STATE_TOPIC_PREFIX}/{self.room}/heartbeat"
+
+    def _device_block(self) -> Dict[str, Any]:
+        return {
+            "identifiers": [f"calisto_{self.room}"],
+            "name": f"Calisto {self.room.title()}",
+            "manufacturer": "Plantronics",
+            "model": "Calisto P7200",
+        }
+
+    # ---- publishes ----
+
+    def publish_configs(self) -> int:
+        published = 0
+
+        threshold_uid = f"calisto_{self.room}_sv_threshold"
+        threshold_cfg_topic = f"{DISCOVERY_PREFIX}/number/{threshold_uid}/config"
+        threshold_payload = {
+            "name": f"{self.room.title()} Speaker Verify Threshold",
+            "unique_id": threshold_uid,
+            "object_id": threshold_uid,
+            "state_topic": self.threshold_state_topic,
+            "command_topic": self.threshold_set_topic,
+            "value_template": "{{ value_json.value }}",
+            "command_template": "{\"value\": {{ value }} }",
+            "min": SV_THRESHOLD_MIN,
+            "max": SV_THRESHOLD_MAX,
+            "step": SV_THRESHOLD_STEP,
+            "mode": "slider",
+            "icon": "mdi:tune",
+            "availability_topic": self.availability_topic,
+            "availability_template": "{{ 'online' if value_json else 'offline' }}",
+            "device": self._device_block(),
+        }
+        if self.ha_bridge.publish(threshold_cfg_topic, json.dumps(threshold_payload), retain=True):
+            published += 1
+
+        notify_uid = f"calisto_{self.room}_sv_audible_notify"
+        notify_cfg_topic = f"{DISCOVERY_PREFIX}/switch/{notify_uid}/config"
+        notify_payload = {
+            "name": f"{self.room.title()} Speaker Verify Audible Notify",
+            "unique_id": notify_uid,
+            "object_id": notify_uid,
+            "state_topic": self.audible_notify_state_topic,
+            "command_topic": self.audible_notify_set_topic,
+            "value_template": "{{ value_json.value }}",
+            "payload_on": "{\"value\": true}",
+            "payload_off": "{\"value\": false}",
+            "state_on": True,
+            "state_off": False,
+            "icon": "mdi:bell-ring",
+            "availability_topic": self.availability_topic,
+            "availability_template": "{{ 'online' if value_json else 'offline' }}",
+            "device": self._device_block(),
+        }
+        if self.ha_bridge.publish(notify_cfg_topic, json.dumps(notify_payload), retain=True):
+            published += 1
+
+        return published
+
+    def publish_state(self) -> int:
+        published = 0
+        threshold = float(self.state.sv_threshold)
+        if self.ha_bridge.publish(
+            self.threshold_state_topic,
+            json.dumps({"value": threshold}),
+            retain=True,
+        ):
+            published += 1
+        notify = bool(self.state.sv_audible_notify)
+        if self.ha_bridge.publish(
+            self.audible_notify_state_topic,
+            json.dumps({"value": notify}),
+            retain=True,
+        ):
+            published += 1
+        return published
+
+    def start(self) -> None:
+        try:
+            n_cfg = self.publish_configs()
+            n_state = self.publish_state()
+            _LOGGER.info(
+                "SpeakerVerifierDiscovery published %d config(s) + %d state(s)",
+                n_cfg, n_state,
+            )
+        except Exception:
+            _LOGGER.exception("SpeakerVerifierDiscovery initial publish raised")
+
+    # ---- command handlers (called by HABridge._on_message) ----
+
+    def handle_threshold_command(self, raw_payload: bytes) -> bool:
+        try:
+            obj = json.loads(raw_payload.decode("utf-8")) if raw_payload else {}
+        except (ValueError, UnicodeDecodeError):
+            _LOGGER.warning("SV threshold/set: malformed payload %r", raw_payload[:80])
+            return False
+        if not isinstance(obj, dict) or "value" not in obj:
+            _LOGGER.warning("SV threshold/set: payload missing 'value'")
+            return False
+        try:
+            value = float(obj["value"])
+        except (TypeError, ValueError):
+            _LOGGER.warning("SV threshold/set: non-numeric value %r", obj.get("value"))
+            return False
+        clamped = max(SV_THRESHOLD_MIN, min(SV_THRESHOLD_MAX, value))
+        self.state.sv_threshold = clamped
+        try:
+            self.enrollments.threshold = clamped
+            self.enrollments.save()
+        except Exception:
+            _LOGGER.exception("SV threshold/set: enrollments persist raised; in-memory value kept")
+        self.publish_state()
+        _LOGGER.info("SV threshold updated to %.2f", clamped)
+        return True
+
+    def handle_audible_notify_command(self, raw_payload: bytes) -> bool:
+        try:
+            obj = json.loads(raw_payload.decode("utf-8")) if raw_payload else {}
+        except (ValueError, UnicodeDecodeError):
+            _LOGGER.warning("SV audible_notify/set: malformed payload %r", raw_payload[:80])
+            return False
+        if not isinstance(obj, dict) or "value" not in obj:
+            _LOGGER.warning("SV audible_notify/set: payload missing 'value'")
+            return False
+        value = obj["value"]
+        if isinstance(value, str):
+            normalized = value.strip().lower() in ("true", "1", "on", "yes")
+        else:
+            normalized = bool(value)
+        self.state.sv_audible_notify = normalized
+        self.publish_state()
+        _LOGGER.info("SV audible_notify updated to %s", normalized)
+        return True

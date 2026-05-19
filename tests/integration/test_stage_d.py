@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from linux_voice_assistant.discovery import SpeakerVerifierDiscovery
 from linux_voice_assistant.enrollment import EnrollmentHandler
 from linux_voice_assistant.ha_bridge import HABridge
 from linux_voice_assistant.speaker_verifier import EnrollmentsStore, SpeakerVerifier
@@ -28,6 +29,66 @@ def test_habridge_subscribes_to_enroll_capture(fake_paho):
     bridge, fake = _build_bridge(fake_paho)
     subs = {t for t, _ in fake.subscriptions}
     assert "calisto/lounge/enroll/capture" in subs
+
+
+def test_habridge_subscribes_to_sv_tunables(fake_paho):
+    _bridge, fake = _build_bridge(fake_paho)
+    subs = {t for t, _ in fake.subscriptions}
+    assert "calisto/lounge/tunable/sv_threshold/set" in subs
+    assert "calisto/lounge/tunable/sv_audible_notify/set" in subs
+
+
+def test_habridge_routes_sv_threshold_set_to_discovery_handler(fake_paho, tmp_path):
+    bridge, fake = _build_bridge(fake_paho)
+    state = make_server_state()
+    state.sv_threshold = 0.70
+    enrollments = EnrollmentsStore(tmp_path / "enrollments.json", room="lounge")
+    sv_disco = SpeakerVerifierDiscovery(
+        ha_bridge=bridge,
+        state=state,
+        enrollments=enrollments,
+        room="lounge",
+    )
+    bridge.attach_speaker_verifier_discovery(sv_disco)
+
+    msg = MagicMock(
+        topic="calisto/lounge/tunable/sv_threshold/set",
+        payload=b'{"value": 0.58}',
+    )
+    bridge._on_message(fake, None, msg)
+    assert state.sv_threshold == pytest.approx(0.58)
+    assert enrollments.threshold == pytest.approx(0.58)
+
+
+def test_habridge_routes_sv_audible_notify_set_to_discovery_handler(fake_paho, tmp_path):
+    bridge, fake = _build_bridge(fake_paho)
+    state = make_server_state()
+    state.sv_audible_notify = True
+    enrollments = EnrollmentsStore(tmp_path / "enrollments.json", room="lounge")
+    sv_disco = SpeakerVerifierDiscovery(
+        ha_bridge=bridge,
+        state=state,
+        enrollments=enrollments,
+        room="lounge",
+    )
+    bridge.attach_speaker_verifier_discovery(sv_disco)
+
+    msg = MagicMock(
+        topic="calisto/lounge/tunable/sv_audible_notify/set",
+        payload=b'{"value": false}',
+    )
+    bridge._on_message(fake, None, msg)
+    assert state.sv_audible_notify is False
+
+
+def test_habridge_sv_tunable_without_attached_discovery_is_silent(fake_paho):
+    bridge, fake = _build_bridge(fake_paho)
+    msg = MagicMock(
+        topic="calisto/lounge/tunable/sv_threshold/set",
+        payload=b'{"value": 0.55}',
+    )
+    # No discovery attached — must not raise.
+    bridge._on_message(fake, None, msg)
 
 
 def test_habridge_routes_enroll_capture_to_handler(fake_paho, tmp_path):

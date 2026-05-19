@@ -90,6 +90,10 @@ class HABridge:
         # Stage D — speaker-enrollment trigger topic (HA-driven flow).
         # Result is published on `calisto/<room>/enroll/result`.
         self.enroll_capture_topic = f"calisto/{room}/enroll/capture"
+        # Stage D — SV live-tunable command topics (N.2 rows 143 + 153).
+        # State echoes back on `tunable/.../state`.
+        self.sv_threshold_set_topic = f"calisto/{room}/tunable/sv_threshold/set"
+        self.sv_audible_notify_set_topic = f"calisto/{room}/tunable/sv_audible_notify/set"
         # Retained state topics — Lovelace cards + v0 automations read these.
         self.led_state_topic = f"calisto/{room}/led/state"
         self.volume_state_topic = f"calisto/{room}/volume/state"
@@ -124,6 +128,9 @@ class HABridge:
         self._restart_hook: Any = None
         # Stage D — enrollment handler for `calisto/<room>/enroll/capture`.
         self._enrollment_handler: Any = None
+        # Stage D — SV live-tunable discovery (publishes configs/state +
+        # owns the command handlers for N.2 rows 143 + 153).
+        self._sv_discovery: Any = None
 
     def _lwt_payload(self) -> str:
         return json.dumps(
@@ -223,10 +230,23 @@ class HABridge:
                         (self.admin_restart_topic, 1),
                         # Stage D — speaker enrollment HA→LVA trigger.
                         (self.enroll_capture_topic, 1),
+                        # Stage D — SV live tunables (N.2 rows 143 + 153).
+                        (self.sv_threshold_set_topic, 1),
+                        (self.sv_audible_notify_set_topic, 1),
                     ]
                 )
             except Exception:
                 _LOGGER.exception("HABridge subscribe failed")
+            # Re-publish SV discovery configs + state on every (re)connect so
+            # HA self-heals after a broker rebuild. publish_configs is
+            # idempotent at the broker (retained).
+            sv_disco = self._sv_discovery
+            if sv_disco is not None:
+                try:
+                    sv_disco.publish_configs()
+                    sv_disco.publish_state()
+                except Exception:
+                    _LOGGER.exception("HABridge: SV discovery republish on connect raised")
         else:
             _LOGGER.error("HABridge connect failed rc=%s", rc)
 
@@ -371,6 +391,23 @@ def _on_message(self: HABridge, _client: Any, _userdata: Any, msg: Any) -> None:
             source=obj.get("source") or ("mqtt_all" if topic == self.cancel_all_topic else "mqtt"),
             request_id=obj.get("request_id"),
         )
+        return
+
+    # Stage D — SV live-tunable command routes. Each command handler
+    # mutates state, persists to enrollments (threshold only), and
+    # publishes the state echo. Discovery object owns the parsing.
+    if topic in (self.sv_threshold_set_topic, self.sv_audible_notify_set_topic):
+        sv_disco = self._sv_discovery
+        if sv_disco is None:
+            _LOGGER.debug("HABridge: sv tunable %s arrived but no discovery attached", topic)
+            return
+        try:
+            if topic == self.sv_threshold_set_topic:
+                sv_disco.handle_threshold_command(raw_payload)
+            else:
+                sv_disco.handle_audible_notify_command(raw_payload)
+        except Exception:
+            _LOGGER.exception("HABridge: SV tunable handler raised")
         return
 
     # Stage D — speaker enrollment trigger. Delegates to EnrollmentHandler
@@ -602,11 +639,18 @@ def _attach_enrollment_handler(self: HABridge, handler: Any) -> None:
     self._enrollment_handler = handler
 
 
+def _attach_speaker_verifier_discovery(self: HABridge, discovery: Any) -> None:
+    """Wire a SpeakerVerifierDiscovery so we re-publish configs/state on
+    every (re)connect and route the two live-tunable command topics."""
+    self._sv_discovery = discovery
+
+
 HABridge.attach_led_controller = _attach_led_controller  # type: ignore[attr-defined]
 HABridge.attach_audio_controllers = _attach_audio_controllers  # type: ignore[attr-defined]
 HABridge.attach_cancel_coordinator = _attach_cancel_coordinator  # type: ignore[attr-defined]
 HABridge.attach_restart_hook = _attach_restart_hook  # type: ignore[attr-defined]
 HABridge.attach_enrollment_handler = _attach_enrollment_handler  # type: ignore[attr-defined]
+HABridge.attach_speaker_verifier_discovery = _attach_speaker_verifier_discovery  # type: ignore[attr-defined]
 HABridge._on_message = _on_message  # type: ignore[attr-defined]
 HABridge._route_say = _route_say  # type: ignore[attr-defined]
 HABridge.publish_volume_state = _publish_volume_state  # type: ignore[attr-defined]

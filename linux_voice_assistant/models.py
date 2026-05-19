@@ -184,8 +184,11 @@ class ServerState:
     heartbeat: Any = None
 
     # Stage D — SpeakerVerifier (D2 two-gate post-wake chain). Live-tunables
-    # are stored on ServerState; HA-side discovery wiring lives in Stage G.
+    # are stored on ServerState; HA-side discovery surface for sv_threshold
+    # + sv_audible_notify ships via SpeakerVerifierDiscovery (N.2 rows 143 +
+    # 153). sv_enabled has no Discovery entity yet (Stage G).
     speaker_verifier: Any = None
+    speaker_verifier_discovery: Any = None
     sv_enabled: bool = True
     sv_audible_notify: bool = True
     sv_threshold: float = 0.70
