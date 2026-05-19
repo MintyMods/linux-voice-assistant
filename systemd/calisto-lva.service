@@ -1,0 +1,46 @@
+# Stage F3 — L3 systemd supervisor for the Linux Voice Assistant (Calisto).
+#
+# Drop into `/etc/systemd/system/calisto-lva.service` on each minty-ai-XXX
+# host. Per H2 H5 the L3 layer is responsible for restarting LVA on
+# process death; combined with WatchdogSec it also catches a hung process
+# that's stopped calling sd_notify("WATCHDOG=1") (Stage F follow-up: LVA
+# is not yet emitting WATCHDOG=1, so WatchdogSec is intentionally left
+# unset until that ships — kept as a comment for reference).
+#
+# The unit ships as a reference; the actual deploy bundles it in
+# `lva-deploy.tar` (per Path B deploy procedure).
+
+[Unit]
+Description=Calisto Linux Voice Assistant
+Wants=network-online.target sound.target
+After=network-online.target sound.target
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=minty
+Group=audio
+WorkingDirectory=/home/minty/docker/linux-voice-assistant
+EnvironmentFile=/home/minty/docker/linux-voice-assistant/.env
+
+# Run LVA via docker-compose so the existing PulseAudio / device-mapping
+# story is preserved. The compose stack is what `_start_stage_b_components`
+# wires Stage F watchdogs into.
+ExecStart=/usr/bin/docker compose up --abort-on-container-exit
+ExecStop=/usr/bin/docker compose down --timeout 10
+
+Restart=on-failure
+RestartSec=2
+
+# Stage F H2 L3 — once LVA emits sd_notify("WATCHDOG=1") every 30s,
+# uncomment this. WatchdogSec=300 gives a 5-minute ceiling per H5 §1.
+#WatchdogSec=300
+#NotifyAccess=main
+
+# Stage F H5 — `sudo systemctl restart calisto.target` is the SSH-driven
+# L5 recovery path. Calisto.target wraps this unit (single-unit deploys
+# can install calisto.target as an alias).
+
+[Install]
+WantedBy=multi-user.target

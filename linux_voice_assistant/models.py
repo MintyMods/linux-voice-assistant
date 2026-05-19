@@ -178,6 +178,19 @@ class ServerState:
     chime_controller: Any = None
     audible_notify_arbiter: Any = None
 
+    # Stage F — cancel coordinator (H1) + heartbeat publisher (K.2 / H2 L4).
+    # Both Any-typed to avoid an import cycle.
+    cancel_coordinator: Any = None
+    heartbeat: Any = None
+    # Wake-fire timestamps in monotonic seconds, retained for rolling
+    # 5-minute counters in the K.2 heartbeat. Bounded by trim-on-append.
+    wake_events: Any = field(default_factory=list)
+    # Most-recent monotonic timestamp `process_audio` produced a frame.
+    # Heartbeat reads this to assert `mic_active` (mic stream alive in last 5s).
+    last_mic_frame_ts: float = 0.0
+    # Most-recent monotonic timestamp `process_audio` ran a wake-word inference.
+    last_wake_inference_ts: float = 0.0
+
     def save_preferences(self) -> None:
         """Save preferences as JSON."""
         _LOGGER.debug("Saving preferences: %s", self.preferences_path)

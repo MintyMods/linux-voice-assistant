@@ -79,6 +79,14 @@ class HABridge:
         self.alarm_stop_topic = f"calisto/{room}/alarm/stop"
         self.say_topic = f"calisto/{room}/say"
         self.say_all_topic = "calisto/all/say"
+        # Stage F5 — K.3 + K.4 cancel topics. Consolidated subscription
+        # (mqtt_router.py owns the subscription matrix; HABridge is the
+        # single transport). Messages route through CancelCoordinator.
+        self.cancel_topic = f"calisto/{room}/cancel"
+        self.cancel_all_topic = "calisto/all/cancel"
+        # Stage F K.13 — admin/restart accepted via MQTT for L4-driven
+        # remote restart.
+        self.admin_restart_topic = f"calisto/{room}/admin/restart"
         # Retained state topics — Lovelace cards + v0 automations read these.
         self.led_state_topic = f"calisto/{room}/led/state"
         self.volume_state_topic = f"calisto/{room}/volume/state"
@@ -103,6 +111,14 @@ class HABridge:
         self._tts_output: Any = None
         self._arbiter: Any = None
         self._loop: Any = None
+        # Stage F5 — cancel coordinator routing target. Attached by
+        # __main__ after construction so HABridge can route K.3 / K.4
+        # without dragging an import cycle through cancel.py.
+        self._cancel_coordinator: Any = None
+        # Stage F5 — optional restart hook for K.13 admin/restart. Caller
+        # supplies a callable that triggers a clean process exit (so
+        # systemd L3 respawns).
+        self._restart_hook: Any = None
 
     def _lwt_payload(self) -> str:
         return json.dumps(
@@ -194,6 +210,12 @@ class HABridge:
                         (self.alarm_stop_topic, 1),
                         (self.say_topic, 1),
                         (self.say_all_topic, 1),
+                        # Stage F5 — K.3 + K.4 + K.13 consolidated here so
+                        # HABridge is the single subscriber (mqtt_router.py
+                        # specifies the matrix; see K.15).
+                        (self.cancel_topic, 1),
+                        (self.cancel_all_topic, 1),
+                        (self.admin_restart_topic, 1),
                     ]
                 )
             except Exception:
@@ -320,6 +342,41 @@ def _on_message(self: HABridge, _client: Any, _userdata: Any, msg: Any) -> None:
         raw_payload = bytes(msg.payload) if msg.payload is not None else b""
     except Exception:
         _LOGGER.exception("HABridge: malformed MQTT message")
+        return
+
+    # Stage F5 — K.3 / K.4 cancel routes through CancelCoordinator.
+    # Coordinator owns reason / scope / tier resolution.
+    if topic in (self.cancel_topic, self.cancel_all_topic):
+        coord = self._cancel_coordinator
+        if coord is None:
+            _LOGGER.debug("HABridge: cancel msg arrived but no coordinator attached")
+            return
+        try:
+            import json as _json
+            obj = _json.loads(raw_payload.decode("utf-8")) if raw_payload else {}
+        except Exception:
+            obj = {}
+        if not isinstance(obj, dict):
+            obj = {}
+        coord.cancel(
+            obj.get("reason"),
+            scope=obj.get("scope"),
+            source=obj.get("source") or ("mqtt_all" if topic == self.cancel_all_topic else "mqtt"),
+            request_id=obj.get("request_id"),
+        )
+        return
+
+    # Stage F K.13 — admin/restart triggers a clean process exit so
+    # systemd L3 / docker-compose restart=unless-stopped respawns LVA.
+    if topic == self.admin_restart_topic:
+        hook = self._restart_hook
+        if hook is None:
+            _LOGGER.warning("HABridge: admin/restart received but no restart hook attached")
+            return
+        try:
+            hook()
+        except Exception:
+            _LOGGER.exception("HABridge: admin/restart hook raised")
         return
 
     # Alarm + say handlers want the raw bytes (JSON); the LED back-compat
@@ -510,8 +567,20 @@ def _publish_phone_button(self: HABridge, action: str) -> None:
     self.publish(topic, "press", qos=1, retain=False)
 
 
+def _attach_cancel_coordinator(self: HABridge, coordinator: Any) -> None:
+    """Wire a CancelCoordinator to route K.3 / K.4 MQTT cancels (F5)."""
+    self._cancel_coordinator = coordinator
+
+
+def _attach_restart_hook(self: HABridge, hook: Any) -> None:
+    """Wire a restart hook for K.13 admin/restart (F5)."""
+    self._restart_hook = hook
+
+
 HABridge.attach_led_controller = _attach_led_controller  # type: ignore[attr-defined]
 HABridge.attach_audio_controllers = _attach_audio_controllers  # type: ignore[attr-defined]
+HABridge.attach_cancel_coordinator = _attach_cancel_coordinator  # type: ignore[attr-defined]
+HABridge.attach_restart_hook = _attach_restart_hook  # type: ignore[attr-defined]
 HABridge._on_message = _on_message  # type: ignore[attr-defined]
 HABridge._route_say = _route_say  # type: ignore[attr-defined]
 HABridge.publish_volume_state = _publish_volume_state  # type: ignore[attr-defined]

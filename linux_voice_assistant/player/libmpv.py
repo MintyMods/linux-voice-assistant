@@ -4,6 +4,7 @@ from typing import Callable, Optional
 
 import mpv
 
+from linux_voice_assistant.gen_check import gen_independent
 from linux_voice_assistant.player.base import AudioPlayer
 from linux_voice_assistant.player.state import PlayerState
 
@@ -241,6 +242,7 @@ class LibMpvPlayer(AudioPlayer):
         effective = self._user_volume * self._duck_factor
         self._mpv.volume = max(0.0, min(100.0, effective))
 
+    @gen_independent
     def _on_end_file(self, event) -> None:
         callback: Optional[Callable[[], None]] = None
 
@@ -280,6 +282,7 @@ class LibMpvPlayer(AudioPlayer):
                 # Callback errors must never break the player
                 pass
 
+    @gen_independent
     def _on_start_file(self, event) -> None:
         """Called when mpv starts playing a file."""
         self._log.debug("unduck() called")
@@ -287,6 +290,7 @@ class LibMpvPlayer(AudioPlayer):
             self._log.debug("_on_start_file: state=%s", self._state)
             self._set_state(PlayerState.PLAYING)
 
+    @gen_independent
     def _on_mpv_log(self, level: str, prefix: str, text: str) -> None:
         """
         Handle mpv log messages.

@@ -23,7 +23,9 @@ from .asr_client import ASRClient
 from .audible_notify import AudibleNotifyArbiter, ChimeController
 from .audio_control import AudioControl
 from .bridge_client import BridgeClient
+from .cancel import CancelCoordinator
 from .ha_bridge import HABridge
+from .heartbeat import HeartbeatPublisher
 from .led import LedController
 from .mic_capture import MicCapture, SpeechBuffer
 from .models import Preferences, ServerState
@@ -467,36 +469,37 @@ async def main() -> None:
 # -----------------------------------------------------------------------------
 
 
-# K.3 canonical reason codes. Unknown values fall back to EXTERNAL.
-_K3_REASONS = {
-    "RED_BUTTON_SOFT",
-    "RED_BUTTON_HARD",
-    "MIC_MUTE_SOFT",
-    "MIC_MUTE_HARD",
-    "VOICE_STOP_WORD",
-    "STOP_EVERYTHING",
-    "STOP_WORD_INPROCESS",
-    "SILENCE_TIMEOUT",
-    "BRIDGE_TIMEOUT",
-    "DASHBOARD",
-    "EXTERNAL",
-}
+from .cancel import VALID_REASONS as _K3_REASONS
 
 
-def _parse_cancel_reason(payload: bytes) -> str:
-    """Map K.3 cancel payload → reason code. v0 publishers send '1'; tolerate them."""
+def _parse_cancel_payload(payload: bytes) -> dict:
+    """Map K.3 cancel payload → dict {reason, scope, source, request_id}.
+
+    Unknown reasons surface as `EXTERNAL`; v0 publishers send bare `'1'`,
+    which is tolerated. Scope/source/request_id default to None.
+    """
+    parsed: dict = {"reason": "EXTERNAL", "scope": None, "source": None, "request_id": None}
     if not payload:
-        return "EXTERNAL"
+        return parsed
     try:
         obj = json.loads(payload.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
-        return "EXTERNAL"
+        return parsed
     if not isinstance(obj, dict):
-        return "EXTERNAL"
+        return parsed
     reason = obj.get("reason")
     if isinstance(reason, str) and reason in _K3_REASONS:
-        return reason
-    return "EXTERNAL"
+        parsed["reason"] = reason
+    scope = obj.get("scope")
+    if isinstance(scope, str) and scope.lower() in ("voice", "alarm", "media", "all"):
+        parsed["scope"] = scope.lower()
+    src = obj.get("source")
+    if isinstance(src, str):
+        parsed["source"] = src
+    rid = obj.get("request_id")
+    if isinstance(rid, str):
+        parsed["request_id"] = rid
+    return parsed
 
 
 def _start_mqtt_cancel_subscriber(state: ServerState, loop: asyncio.AbstractEventLoop) -> None:
@@ -523,19 +526,24 @@ def _start_mqtt_cancel_subscriber(state: ServerState, loop: asyncio.AbstractEven
 
     cancel_beep = str(_SOUNDS_DIR / "mute_switch_on.flac")
 
-    def _cancel_pipeline(reason: str) -> None:
-        sat = state.satellite
-        if sat is None:
-            _LOGGER.debug("cancel received (reason=%s) but no satellite connected; nothing to abort", reason)
+    def _cancel_pipeline(parsed: dict) -> None:
+        # Stage F1 — every MQTT-driven cancel routes through the
+        # coordinator. The coordinator owns scope/tier resolution +
+        # fan-out to voice/alarm/media. Audible "I heard you" beep is
+        # scheduled separately so it survives the voice teardown.
+        coord = getattr(state, "cancel_coordinator", None)
+        if coord is None:
+            _LOGGER.debug(
+                "cancel received (reason=%s) but no CancelCoordinator wired; dropping",
+                parsed.get("reason"),
+            )
             return
-        try:
-            sat.stop(cancel_reason=reason)
-            _LOGGER.info("voice pipeline aborted via MQTT cancel (reason=%s)", reason)
-        except Exception:
-            _LOGGER.exception("satellite.stop() raised during MQTT cancel")
-        # Audible feedback that the cancel was received, regardless of what
-        # phase the pipeline was in. Played on tts_player AFTER stop() (which
-        # itself calls tts_player.stop()) so it survives the abort.
+        coord.cancel(
+            parsed.get("reason"),
+            scope=parsed.get("scope"),
+            source=parsed.get("source") or "mqtt",
+            request_id=parsed.get("request_id"),
+        )
         try:
             loop.call_later(0.15, lambda: state.tts_player.play(cancel_beep))
         except Exception:
@@ -557,8 +565,8 @@ def _start_mqtt_cancel_subscriber(state: ServerState, loop: asyncio.AbstractEven
 
     def _on_message(_c, _ud, msg):
         _LOGGER.debug("MQTT cancel msg topic=%s payload=%r", msg.topic, msg.payload)
-        reason = _parse_cancel_reason(msg.payload)
-        loop.call_soon_threadsafe(_cancel_pipeline, reason)
+        parsed = _parse_cancel_payload(msg.payload)
+        loop.call_soon_threadsafe(_cancel_pipeline, parsed)
 
     client = mqtt.Client(
         mqtt.CallbackAPIVersion.VERSION2,  # type: ignore[attr-defined]
@@ -648,6 +656,50 @@ def _start_stage_b_components(state: ServerState, loop: asyncio.AbstractEventLoo
     # Publish initial STARTING then IDLE per K.1.3 (startup transition).
     session.transition_to("STARTING", reason="startup")
     session.transition_to("IDLE", reason="startup")
+
+    # Stage F1 — CancelCoordinator is the single entry-point for every
+    # cancel trigger (HID, MQTT K.3/K.4, voice stop-word, internal). It
+    # must exist before LedController is constructed so the phone-cancel
+    # callback can route through it.
+    coord = CancelCoordinator(state, loop=loop)
+    if ha_bridge is not None:
+        try:
+            ha_bridge.attach_cancel_coordinator(coord)
+        except Exception:
+            _LOGGER.exception("Stage F1: ha_bridge.attach_cancel_coordinator raised")
+
+        # Stage F5 — K.13 admin/restart: clean exit so systemd / docker
+        # restart=unless-stopped respawns. Implemented as `sys.exit(0)`
+        # scheduled on the loop so paho's on_message handler returns
+        # cleanly before the process dies.
+        def _restart_hook() -> None:
+            _LOGGER.warning("K.13 admin/restart received — exiting for L3 respawn")
+            loop.call_soon_threadsafe(lambda: sys.exit(0))
+        try:
+            ha_bridge.attach_restart_hook(_restart_hook)
+        except Exception:
+            _LOGGER.exception("Stage F5: ha_bridge.attach_restart_hook raised")
+
+    # Stage F2 — Heartbeat publisher (K.2 every 60s, H2 L4).
+    try:
+        hb_interval = int(os.environ.get("HEARTBEAT_INTERVAL_S", "60"))
+    except ValueError:
+        hb_interval = 60
+    heartbeat = HeartbeatPublisher(
+        state,
+        ha_bridge=ha_bridge,
+        room=room,
+        interval_s=hb_interval,
+    )
+    heartbeat.start(loop)
+    state.heartbeat = heartbeat
+
+    # Stage F4 — DeviceSession 30s slow re-assert watchdog (H4).
+    try:
+        reassert_interval = int(os.environ.get("STATE_REASSERT_INTERVAL_S", "30"))
+    except ValueError:
+        reassert_interval = 30
+    session.start_state_watchdog(loop, interval_s=reassert_interval)
 
     # BridgeClient — wired in B3 as the THINKING-phase outbound HTTP.
     bridge_url = os.environ.get("BRIDGE_URL")
@@ -803,12 +855,10 @@ def _start_stage_b_components(state: ServerState, loop: asyncio.AbstractEventLoo
         except Exception:
             _LOGGER.exception("WakeCaptureDiscovery construction failed")
 
-    # Stage F placeholders — surfaced into logs so deploy-time misconfigs
-    # are visible before F lands the watchdog/heartbeat code.
     _LOGGER.info(
-        "Stage F env (read but unused in B3): STATE_REASSERT_INTERVAL_S=%s HEARTBEAT_INTERVAL_S=%s",
-        os.environ.get("STATE_REASSERT_INTERVAL_S", "30"),
-        os.environ.get("HEARTBEAT_INTERVAL_S", "60"),
+        "Stage F components wired: STATE_REASSERT_INTERVAL_S=%d HEARTBEAT_INTERVAL_S=%d",
+        reassert_interval,
+        hb_interval,
     )
 
 
@@ -828,11 +878,20 @@ def _start_stage_e1_led(state: ServerState, loop: asyncio.AbstractEventLoop) -> 
         return
 
     def _phone_cancel(reason: str) -> None:
-        # Routed onto the asyncio loop by LedController._dispatch_phone_press.
+        # Stage F1 — route every red-button cancel through the coordinator
+        # so soft/hard tier resolution and music-touches semantics live
+        # in one place (cancel.py), not split between callers.
+        coord = state.cancel_coordinator
+        if coord is None:
+            try:
+                session._cancel_via_satellite(reason)
+            except Exception:
+                _LOGGER.exception("Stage E.1: phone-cancel fallback raised")
+            return
         try:
-            session._cancel_via_satellite(reason)
+            coord.cancel(reason, source="hid_phone_button")
         except Exception:
-            _LOGGER.exception("Stage E.1: phone-cancel routing raised")
+            _LOGGER.exception("Stage F1: phone-cancel coordinator raised")
 
     def _phone_button(action: str) -> None:
         # v0 back-compat — publish the legacy `calisto/<room>/button/
@@ -1046,6 +1105,12 @@ def process_audio(state: ServerState, mic, block_size: int):
                         if not audio_chunk:
                             continue
 
+                    # Stage F2 — mic-frame liveness for K.2 heartbeat (`mic_active`).
+                    # Stamp every frame regardless of streaming state: an active
+                    # mic stream is what we want to assert, not the streaming
+                    # decision downstream.
+                    state.last_mic_frame_ts = time.monotonic()
+
                     if state.satellite is None or not hasattr(state.satellite, "_is_streaming_audio"):
                         continue
 
@@ -1222,6 +1287,13 @@ def process_audio(state: ServerState, mic, block_size: int):
                                         except Exception:
                                             _LOGGER.exception("WakeCapture.on_wake_fire raised")
                                     state.satellite.wakeup(wake_word, wake_id=wake_id)
+                                    # Stage F2 — record for K.2 wake_count_5m.
+                                    try:
+                                        state.wake_events.append(now)
+                                        if len(state.wake_events) > 1024:
+                                            del state.wake_events[: len(state.wake_events) - 512]
+                                    except Exception:
+                                        pass
                                     last_active = now
 
                         # Always process to keep state correct
@@ -1239,8 +1311,27 @@ def process_audio(state: ServerState, mic, block_size: int):
                                 stopped = True
 
                         if stopped and (state.stop_word.id in state.active_wake_words) and not state.muted:
-                            _LOGGER.debug("Stop word detected")
-                            state.satellite.stop(cancel_reason="STOP_WORD_INPROCESS")
+                            # Stage F1 H1 — barge-in stop-word fires only while
+                            # LVA is producing output the user might want to
+                            # interrupt (THINKING or SPEAKING). In LISTENING /
+                            # FOLLOWUP the utterance must reach ASR/LLM intact.
+                            ds = getattr(state, "device_session", None)
+                            current_state = ds.state_value.value if ds is not None else state.device_state
+                            if current_state in ("THINKING", "SPEAKING"):
+                                _LOGGER.debug("Stop word detected (state=%s) — firing barge-in", current_state)
+                                coord = state.cancel_coordinator
+                                if coord is not None:
+                                    coord.cancel(
+                                        "STOP_WORD_INPROCESS",
+                                        source="voice_barge_in",
+                                    )
+                                else:
+                                    state.satellite.stop(cancel_reason="STOP_WORD_INPROCESS")
+                            else:
+                                _LOGGER.debug(
+                                    "Stop word detected but H1-gated out (state=%s); dropping",
+                                    current_state,
+                                )
                     except Exception:
                         _LOGGER.exception("Unexpected error handling audio")
             # Inner `while` broke out — pause was requested. The `with`

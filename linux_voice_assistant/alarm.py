@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Optional
 
+from .gen_check import gen_independent
+
 if TYPE_CHECKING:
     from .ha_bridge import HABridge
     from .mpv_player import MpvMediaPlayer
@@ -159,10 +161,15 @@ class AlarmController:
 
     # -- internals --------------------------------------------------------
 
+    @gen_independent
     def _on_alarm_finished(self) -> None:
         """mpv signals end-of-playback. The ringtone is short; we loop by
         re-issuing play() if the alarm is still active. The duration timer
-        is the authoritative stop signal."""
+        is the authoritative stop signal.
+
+        Per H3 §exception: alarm lifecycle is decoupled from the voice
+        generation counter — a cancelled voice session should not auto-
+        stop a ringing alarm."""
         with self._lock:
             req = self._current
             if req is None:
@@ -184,6 +191,7 @@ class AlarmController:
             timer.cancel()
             self._stop_timer = None
 
+    @gen_independent
     def _on_duration_elapsed(self) -> None:
         _LOGGER.info("alarm duration elapsed; auto-stopping")
         self.stop_alarm()

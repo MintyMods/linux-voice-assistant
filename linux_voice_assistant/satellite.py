@@ -50,6 +50,7 @@ from pymicro_wakeword import MicroWakeWord
 from pyopen_wakeword import OpenWakeWord
 
 from .api_server import APIServer
+from .gen_check import gen_checked
 from .entity import (
     MediaPlayerEntity,
     MicSettingEntity,
@@ -792,6 +793,7 @@ class VoiceSatelliteProtocol(APIServer):
             done_callback=lambda: self._on_wakeup_sound_finished(wake_word_phrase, captured_gen),
         )
 
+    @gen_checked
     def _on_wakeup_sound_finished(self, wake_word_phrase: str, captured_gen: int = 0) -> None:
         """Callback invoked when the wakeup sound finishes playing.
 
@@ -957,6 +959,7 @@ class VoiceSatelliteProtocol(APIServer):
         _LOGGER.debug("Unducking music")
         self.state.music_player.unduck()
 
+    @gen_checked
     def _tts_finished(self, captured_gen: int = 0) -> None:
         if not self._gen_check(captured_gen):
             _LOGGER.debug("TTS-finished callback dropped: generation moved (captured=%d, current=%d)", captured_gen, self._generation)
@@ -982,6 +985,7 @@ class VoiceSatelliteProtocol(APIServer):
 
         _LOGGER.debug("TTS response finished")
 
+    @gen_checked
     def _play_timer_finished(self, captured_gen: int = 0) -> None:
         if not self._gen_check(captured_gen):
             _LOGGER.debug("Timer-finished callback dropped: generation moved (captured=%d, current=%d)", captured_gen, self._generation)

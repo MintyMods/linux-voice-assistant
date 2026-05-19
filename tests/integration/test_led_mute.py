@@ -536,6 +536,10 @@ def test_on_connect_subscribes_to_all_back_compat_topics(fake_paho):
         bridge.alarm_stop_topic,
         bridge.say_topic,
         bridge.say_all_topic,
+        # Stage F5 — consolidated K.3/K.4/K.13 subscriptions.
+        bridge.cancel_topic,
+        bridge.cancel_all_topic,
+        bridge.admin_restart_topic,
     }
     # All at QoS 1.
     qos_values = {qos for _t, qos in fake.subscriptions}

@@ -151,6 +151,11 @@ class LedController:
         self._last_state: Optional["State"] = None
         self._hard_cancel_timer: Optional[threading.Timer] = None
 
+    @property
+    def last_hid_event_ts(self) -> float:
+        """Monotonic timestamp of the last hidraw read (F2 — heartbeat)."""
+        return getattr(self._buttons, "last_event_ts", 0.0)
+
     # ---- lifecycle ----------------------------------------------------
 
     def start(self) -> None:

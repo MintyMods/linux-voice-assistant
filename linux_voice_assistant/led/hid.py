@@ -226,6 +226,9 @@ class HidButtonListener:
         self._stop = stop_event or threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._last_mute_press_at = 0.0
+        # Stage F2 — last successful hidraw read timestamp (monotonic).
+        # Heartbeat reads this to assert hidraw_ok (event seen <5s ago).
+        self.last_event_ts: float = 0.0
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -292,6 +295,8 @@ class HidButtonListener:
                 return
             if not buf or len(buf) < 2:
                 continue
+            # Stage F2 — heartbeat-side liveness probe.
+            self.last_event_ts = time.monotonic()
             if buf[0] == _MUTE_REPORT_ID:
                 # 0x0b 0x01 = press; 0x0b 0x00 = release. Each physical
                 # press fires both rapidly — only act on the press edge.

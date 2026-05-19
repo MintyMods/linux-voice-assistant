@@ -2,6 +2,7 @@
 import logging
 from typing import Callable, List, Optional, Union
 
+from .gen_check import gen_independent
 from .player.libmpv import LibMpvPlayer
 from .player.state import PlayerState
 
@@ -20,8 +21,40 @@ class MpvMediaPlayer:
         self._player = LibMpvPlayer(device=device, role=role)
         self._done_callback: Optional[Callable[[], None]] = None
         self._playlist: List[str] = []
+        # Stage F5 — per-channel supervisor metadata (G1 + H5).
+        # `channel_status` is read by the K.2 heartbeat publisher; the
+        # F5 follow-up adds the respawn-on-crash policy that drives it
+        # (silent for tts/chime, position-resume for media, immediate-
+        # resume-full-volume for alarm). For now `ok` baseline + manual
+        # demote via `mark_channel_degraded` / `_dead` keeps the heartbeat
+        # honest while the actual content-recovery is staged in.
+        self.channel_status: str = "ok"
+        self._respawn_events: List[float] = []
 
         self._log.debug("MpvMediaPlayer initialized (device=%s, role=%s)", device, role)
+
+    def mark_channel_degraded(self) -> None:
+        """Mark this channel as degraded (heartbeat surface). Idempotent."""
+        if self.channel_status != "dead":
+            self.channel_status = "degraded"
+
+    def mark_channel_dead(self) -> None:
+        self.channel_status = "dead"
+
+    def mark_channel_ok(self) -> None:
+        self.channel_status = "ok"
+
+    def record_respawn(self, ts: float) -> int:
+        """Append a respawn timestamp and return rolling 30s count.
+
+        Per H5 §3 mpv supervisor policy: >3 respawns in 30s → degraded.
+        Caller decides what to do with the count; supervisor demotes
+        `channel_status` accordingly.
+        """
+        cutoff = ts - 30.0
+        self._respawn_events = [t for t in self._respawn_events if t >= cutoff]
+        self._respawn_events.append(ts)
+        return len(self._respawn_events)
 
     def play(
         self,
@@ -64,8 +97,12 @@ class MpvMediaPlayer:
         next_url = self._playlist.pop(0)
         self._player.play(next_url, done_callback=self._on_track_finished, stop_first=stop_first)
 
+    @gen_independent
     def _on_track_finished(self) -> None:
-        """Called when a track finishes - plays next or invokes done callback."""
+        """Called when a track finishes - plays next or invokes done callback.
+
+        Per H3 §exception: MediaPlayer is gen-independent; music plays
+        across voice sessions and is not invalidated by a voice cancel."""
         if self._playlist:
             # More tracks to play
             next_url = self._playlist.pop(0)

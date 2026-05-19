@@ -23,6 +23,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Optional, Union
 
 from .bridge_client import StaleGeneration
+from .gen_check import gen_checked
 
 if TYPE_CHECKING:
     from .ha_bridge import HABridge
@@ -76,6 +77,11 @@ class DeviceSession:
         self._state: State = State.IDLE
         self._session_id: Optional[str] = None
         self._last_change_ts: float = time.monotonic()
+        # Stage F4 — H4 30s slow re-assert watchdog. Initialised lazily by
+        # start_state_watchdog() so unit tests that build a DS without a
+        # running loop don't accidentally schedule a task.
+        self._watchdog_task: "Optional[asyncio.Task[None]]" = None
+        self._watchdog_stop = False
         state.device_session = self
         state.device_state = self._state.value
         state.session_id = None
@@ -237,6 +243,7 @@ class DeviceSession:
 
     # -- B3 lifecycle hooks (audio path) -----------------------------------
 
+    @gen_checked
     def on_wake_chime_finished(self, captured_gen: int) -> bool:
         """v1 path: chime done, start local mic capture.
 
@@ -413,11 +420,62 @@ class DeviceSession:
                 except Exception:
                     pass
 
-    def _cancel_via_satellite(self, reason: str) -> None:
-        """Trigger the same cancel chain a red-button press would, with a
-        component-specific reason. Bumps gen → satellite.stop() → IDLE +
-        K.1 publish + bridge cancel are handled there.
+    # -- Stage F4 H4 — slow re-assert state watchdog -----------------------
+
+    def start_state_watchdog(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        *,
+        interval_s: int = 30,
+    ) -> None:
+        """Schedule the 30s slow re-assert task on `loop`.
+
+        Idempotent: a second call replaces the prior task (used in tests).
+        Cancellable via `stop_state_watchdog()`.
         """
+        if self._watchdog_task is not None and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+        self._watchdog_stop = False
+        self._watchdog_task = loop.create_task(self._watchdog_loop(interval_s))
+
+    def stop_state_watchdog(self) -> None:
+        self._watchdog_stop = True
+        t = self._watchdog_task
+        if t is not None and not t.done():
+            t.cancel()
+        self._watchdog_task = None
+
+    async def _watchdog_loop(self, interval_s: int) -> None:
+        """Re-publish the current state every `interval_s` seconds (H4)."""
+        try:
+            while not self._watchdog_stop:
+                try:
+                    await asyncio.sleep(interval_s)
+                except asyncio.CancelledError:
+                    break
+                if self._watchdog_stop:
+                    break
+                try:
+                    self.publish_current(reason="watchdog_reassert")
+                except Exception:
+                    _LOGGER.exception("state watchdog re-publish raised; continuing loop")
+        finally:
+            _LOGGER.debug("DeviceSession state watchdog exiting")
+
+    def _cancel_via_satellite(self, reason: str) -> None:
+        """Trigger the same cancel chain a red-button press would.
+
+        Stage F1: route through CancelCoordinator when present so tier /
+        scope semantics are uniform across all triggers. Fallback path
+        kept for cold-start and Stage A tests that bypass __main__.
+        """
+        coord = getattr(self.state, "cancel_coordinator", None)
+        if coord is not None:
+            try:
+                coord.cancel(reason, source="device_session")
+                return
+            except Exception:
+                _LOGGER.exception("CancelCoordinator.cancel raised; falling back to sat.stop")
         sat = getattr(self.state, "satellite", None)
         if sat is None:
             self.transition_to(State.IDLE, reason="cancel_no_sat", cancel_reason=reason)
