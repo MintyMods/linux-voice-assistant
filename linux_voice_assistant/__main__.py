@@ -1229,6 +1229,29 @@ def _start_stage_e1_led(state: ServerState, loop: asyncio.AbstractEventLoop) -> 
         # can defend (Path B keeps the USB claim open; MicCapture.feed
         # is the load-bearing gate).
         state.muted = muted
+        _LOGGER.info("Stage E.1: _mute_state_changed fired (muted=%s)", muted)
+        # Drive the recorder pause/resume handshake so WebRTC + uWW stop
+        # running while muted (~10% CPU saving). request_pause/resume can
+        # block up to 2-3s on the AudioControl condition; LedController
+        # dispatches this callback via call_soon_threadsafe onto the
+        # asyncio loop, so we offload to the default executor to avoid
+        # stalling the loop.
+        audio_ctrl = state.audio_control
+        if audio_ctrl is not None:
+            def _drive_audio_ctrl() -> None:
+                try:
+                    if muted:
+                        ok = audio_ctrl.request_pause()
+                        _LOGGER.info("Stage E.1: AudioControl.request_pause → %s", ok)
+                    else:
+                        ok = audio_ctrl.request_resume()
+                        _LOGGER.info("Stage E.1: AudioControl.request_resume → %s", ok)
+                except Exception:
+                    _LOGGER.exception(
+                        "Stage E.1: AudioControl.%s raised",
+                        "request_pause" if muted else "request_resume",
+                    )
+            loop.run_in_executor(None, _drive_audio_ctrl)
         bridge = state.ha_bridge
         publish = getattr(bridge, "publish_mute_state", None) if bridge else None
         if publish is None:
