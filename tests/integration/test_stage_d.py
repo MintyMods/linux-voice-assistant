@@ -20,7 +20,7 @@ from tests.conftest import make_server_state
 
 def _build_bridge(fake_paho):
     created, factory = fake_paho
-    bridge = HABridge(room="lounge", host="127.0.0.1", port=1883, client_factory=factory)
+    bridge = HABridge(room="living_room", host="127.0.0.1", port=1883, client_factory=factory)
     bridge.start()
     return bridge, created[0]
 
@@ -28,31 +28,31 @@ def _build_bridge(fake_paho):
 def test_habridge_subscribes_to_enroll_capture(fake_paho):
     bridge, fake = _build_bridge(fake_paho)
     subs = {t for t, _ in fake.subscriptions}
-    assert "calisto/lounge/enroll/capture" in subs
+    assert "calisto/living_room/enroll/capture" in subs
 
 
 def test_habridge_subscribes_to_sv_tunables(fake_paho):
     _bridge, fake = _build_bridge(fake_paho)
     subs = {t for t, _ in fake.subscriptions}
-    assert "calisto/lounge/tunable/sv_threshold/set" in subs
-    assert "calisto/lounge/tunable/sv_audible_notify/set" in subs
+    assert "calisto/living_room/tunable/sv_threshold/set" in subs
+    assert "calisto/living_room/tunable/sv_audible_notify/set" in subs
 
 
 def test_habridge_routes_sv_threshold_set_to_discovery_handler(fake_paho, tmp_path):
     bridge, fake = _build_bridge(fake_paho)
     state = make_server_state()
     state.sv_threshold = 0.70
-    enrollments = EnrollmentsStore(tmp_path / "enrollments.json", room="lounge")
+    enrollments = EnrollmentsStore(tmp_path / "enrollments.json", room="living_room")
     sv_disco = SpeakerVerifierDiscovery(
         ha_bridge=bridge,
         state=state,
         enrollments=enrollments,
-        room="lounge",
+        room="living_room",
     )
     bridge.attach_speaker_verifier_discovery(sv_disco)
 
     msg = MagicMock(
-        topic="calisto/lounge/tunable/sv_threshold/set",
+        topic="calisto/living_room/tunable/sv_threshold/set",
         payload=b'{"value": 0.58}',
     )
     bridge._on_message(fake, None, msg)
@@ -64,17 +64,17 @@ def test_habridge_routes_sv_audible_notify_set_to_discovery_handler(fake_paho, t
     bridge, fake = _build_bridge(fake_paho)
     state = make_server_state()
     state.sv_audible_notify = True
-    enrollments = EnrollmentsStore(tmp_path / "enrollments.json", room="lounge")
+    enrollments = EnrollmentsStore(tmp_path / "enrollments.json", room="living_room")
     sv_disco = SpeakerVerifierDiscovery(
         ha_bridge=bridge,
         state=state,
         enrollments=enrollments,
-        room="lounge",
+        room="living_room",
     )
     bridge.attach_speaker_verifier_discovery(sv_disco)
 
     msg = MagicMock(
-        topic="calisto/lounge/tunable/sv_audible_notify/set",
+        topic="calisto/living_room/tunable/sv_audible_notify/set",
         payload=b'{"value": false}',
     )
     bridge._on_message(fake, None, msg)
@@ -84,7 +84,7 @@ def test_habridge_routes_sv_audible_notify_set_to_discovery_handler(fake_paho, t
 def test_habridge_sv_tunable_without_attached_discovery_is_silent(fake_paho):
     bridge, fake = _build_bridge(fake_paho)
     msg = MagicMock(
-        topic="calisto/lounge/tunable/sv_threshold/set",
+        topic="calisto/living_room/tunable/sv_threshold/set",
         payload=b'{"value": 0.55}',
     )
     # No discovery attached — must not raise.
@@ -94,11 +94,11 @@ def test_habridge_sv_tunable_without_attached_discovery_is_silent(fake_paho):
 def test_habridge_routes_enroll_capture_to_handler(fake_paho, tmp_path):
     bridge, fake = _build_bridge(fake_paho)
     state = make_server_state()
-    state.room = "lounge"
+    state.room = "living_room"
     state.wake_capture = MagicMock(
         snapshot_recent_pcm=MagicMock(return_value=b"\x00\x00" * 24000),
     )
-    store = EnrollmentsStore(tmp_path / "enrollments.json", room="lounge")
+    store = EnrollmentsStore(tmp_path / "enrollments.json", room="living_room")
     verifier = SpeakerVerifier(store=store, model_path=None)
     verifier.embed = MagicMock(return_value=[0.1] * 512)
     verifier.outlier_check = MagicMock(return_value=True)
@@ -107,7 +107,7 @@ def test_habridge_routes_enroll_capture_to_handler(fake_paho, tmp_path):
     bridge.attach_enrollment_handler(handler)
 
     msg = MagicMock(
-        topic="calisto/lounge/enroll/capture",
+        topic="calisto/living_room/enroll/capture",
         payload=json.dumps({"user_id": "rob", "phrase": "test"}).encode(),
     )
     bridge._on_message(fake, None, msg)
@@ -122,7 +122,7 @@ def test_habridge_routes_enroll_capture_to_handler(fake_paho, tmp_path):
 
 def test_wake_capture_snapshot_recent_pcm(tmp_path):
     wc = WakeCapture(
-        capture_dir=tmp_path, room="lounge", device_id="dev",
+        capture_dir=tmp_path, room="living_room", device_id="dev",
     )
     # 1s @ 16kHz mono int16 = 32000 bytes = 16000 two-byte samples.
     wc.feed(b"\x01\x00" * 16000)
@@ -134,14 +134,14 @@ def test_wake_capture_snapshot_recent_pcm(tmp_path):
 
 
 def test_wake_capture_snapshot_capped_at_ring_extent(tmp_path):
-    wc = WakeCapture(capture_dir=tmp_path, room="lounge", device_id="dev")
+    wc = WakeCapture(capture_dir=tmp_path, room="living_room", device_id="dev")
     wc.feed(b"\x01\x00" * 8000)  # 0.5s only (16000 bytes)
     pcm = wc.snapshot_recent_pcm(5.0)  # ask for 5s — ring has 0.5s
     assert len(pcm) == 16000
 
 
 def test_update_speaker_match_writes_to_sidecar(tmp_path):
-    wc = WakeCapture(capture_dir=tmp_path, room="lounge", device_id="dev")
+    wc = WakeCapture(capture_dir=tmp_path, room="living_room", device_id="dev")
     wc.feed(b"\x00" * 32000)
     wake_id = wc.on_wake_fire(score=0.8)
     # Sidecar written synchronously since no executor loop attached.
@@ -151,7 +151,7 @@ def test_update_speaker_match_writes_to_sidecar(tmp_path):
 
 
 def test_update_wake_label_gate2_reject(tmp_path):
-    wc = WakeCapture(capture_dir=tmp_path, room="lounge", device_id="dev")
+    wc = WakeCapture(capture_dir=tmp_path, room="living_room", device_id="dev")
     wc.feed(b"\x00" * 32000)
     wake_id = wc.on_wake_fire(score=0.8)
     assert wc.update_wake_label(wake_id, "gate2_reject", "gate2_reject") is True
@@ -161,7 +161,7 @@ def test_update_wake_label_gate2_reject(tmp_path):
 
 
 def test_update_wake_label_invalid_label_rejected(tmp_path):
-    wc = WakeCapture(capture_dir=tmp_path, room="lounge", device_id="dev")
+    wc = WakeCapture(capture_dir=tmp_path, room="living_room", device_id="dev")
     wc.feed(b"\x00" * 32000)
     wake_id = wc.on_wake_fire(score=0.8)
     assert wc.update_wake_label(wake_id, "purple", "nope") is False

@@ -24,7 +24,7 @@ from tests.conftest import make_server_state
 def _build_bridge(fake_paho):
     created, factory = fake_paho
     bridge = HABridge(
-        room="lounge", host="127.0.0.1", port=1883, client_factory=factory,
+        room="living_room", host="127.0.0.1", port=1883, client_factory=factory,
     )
     bridge.start()
     return bridge, created[0]
@@ -40,7 +40,7 @@ def test_habridge_routes_k3_to_coordinator(fake_paho):
     bridge.attach_cancel_coordinator(coord)
 
     msg = MagicMock(
-        topic="calisto/lounge/cancel",
+        topic="calisto/living_room/cancel",
         payload=json.dumps({"reason": "DASHBOARD"}).encode(),
     )
     bridge._on_message(fake, None, msg)
@@ -72,9 +72,9 @@ def test_habridge_routes_k4_broadcast_cancel(fake_paho):
 def test_habridge_cancel_subscribed_at_connect(fake_paho):
     bridge, fake = _build_bridge(fake_paho)
     subs = {t for t, _qos in fake.subscriptions}
-    assert "calisto/lounge/cancel" in subs
+    assert "calisto/living_room/cancel" in subs
     assert "calisto/all/cancel" in subs
-    assert "calisto/lounge/admin/restart" in subs
+    assert "calisto/living_room/admin/restart" in subs
 
 
 def test_habridge_admin_restart_invokes_hook(fake_paho):
@@ -85,7 +85,7 @@ def test_habridge_admin_restart_invokes_hook(fake_paho):
         invoked["count"] += 1
     bridge.attach_restart_hook(_hook)
 
-    msg = MagicMock(topic="calisto/lounge/admin/restart", payload=b"{}")
+    msg = MagicMock(topic="calisto/living_room/admin/restart", payload=b"{}")
     bridge._on_message(fake, None, msg)
     assert invoked["count"] == 1
 
@@ -109,7 +109,7 @@ async def test_state_watchdog_republishes_current(fake_paho):
 
     reassertions = [
         p for (t, p, _, _) in fake.publishes
-        if t == "calisto/lounge/session/state" and "watchdog_reassert" in p
+        if t == "calisto/living_room/session/state" and "watchdog_reassert" in p
     ]
     assert len(reassertions) >= 1
 

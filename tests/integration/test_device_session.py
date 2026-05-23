@@ -39,7 +39,7 @@ def _last_publish(client) -> dict:
 
 def test_habridge_arms_lwt_before_connect(fake_paho):
     created, factory = fake_paho
-    hb = HABridge(room="lounge", host="127.0.0.1", port=1883, username="u", password="p", client_factory=factory)
+    hb = HABridge(room="living_room", host="127.0.0.1", port=1883, username="u", password="p", client_factory=factory)
     hb.start()
     assert len(created) == 1
     client = created[0]
@@ -48,7 +48,7 @@ def test_habridge_arms_lwt_before_connect(fake_paho):
     # raises if the order is reversed.
     assert client.will is not None
     will_topic, will_payload, will_qos, will_retain = client.will
-    assert will_topic == "calisto/lounge/session/state"
+    assert will_topic == "calisto/living_room/session/state"
     assert will_qos == 1
     assert will_retain is True
     lwt = json.loads(will_payload)
@@ -64,7 +64,7 @@ def test_habridge_arms_lwt_before_connect(fake_paho):
 
 def test_habridge_publish_state_emits_k1_payload(fake_paho):
     created, factory = fake_paho
-    hb = HABridge(room="lounge", host="127.0.0.1", client_factory=factory)
+    hb = HABridge(room="living_room", host="127.0.0.1", client_factory=factory)
     hb.start()
     client = created[0]
 
@@ -87,7 +87,7 @@ def test_habridge_publish_state_emits_k1_payload(fake_paho):
     # Must be published retained QoS1 per K.1. Filter past the B3 LED mirror.
     state_pubs = [p for p in client.publishes if p[0].endswith("/session/state")]
     topic, _, qos, retain = state_pubs[-1]
-    assert topic == "calisto/lounge/session/state"
+    assert topic == "calisto/living_room/session/state"
     assert qos == 1
     assert retain is True
 
@@ -98,7 +98,7 @@ def test_habridge_publish_state_emits_k1_payload(fake_paho):
 def test_device_session_transitions_publish_to_habridge(fake_paho):
     created, factory = fake_paho
     state = _make_state()
-    hb = HABridge(room="lounge", host="127.0.0.1", client_factory=factory)
+    hb = HABridge(room="living_room", host="127.0.0.1", client_factory=factory)
     hb.start()
     client = created[0]
     ds = DeviceSession(state, ha_bridge=hb)
@@ -179,7 +179,7 @@ def test_device_session_generation_increments_and_mirrors_to_state():
 def test_device_session_cancel_publish_carries_cancel_reason(fake_paho):
     created, factory = fake_paho
     state = _make_state()
-    hb = HABridge(room="lounge", host="127.0.0.1", client_factory=factory)
+    hb = HABridge(room="living_room", host="127.0.0.1", client_factory=factory)
     hb.start()
     client = created[0]
     ds = DeviceSession(state, ha_bridge=hb)
@@ -268,7 +268,7 @@ def test_satellite_shim_routes_through_device_session(fake_paho):
 
     created, factory = fake_paho
     state = _make_state()
-    hb = HABridge(room="lounge", host="127.0.0.1", client_factory=factory)
+    hb = HABridge(room="living_room", host="127.0.0.1", client_factory=factory)
     hb.start()
     client = created[0]
     ds = DeviceSession(state, ha_bridge=hb)

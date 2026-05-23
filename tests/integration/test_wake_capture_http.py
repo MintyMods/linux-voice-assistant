@@ -38,7 +38,7 @@ def http_server(tmp_path: Path):
     clock = _Clock()
     wc = WakeCapture(
         capture_dir=capture_dir,
-        room="lounge",
+        room="living_room",
         device_id="minty-test-01",
         max_files=100,
         clock=clock,

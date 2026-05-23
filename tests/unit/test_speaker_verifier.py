@@ -49,7 +49,7 @@ def _stub_vec(seed: int) -> List[float]:
 
 
 def test_store_load_missing_file_silent(tmp_path):
-    store = EnrollmentsStore(tmp_path / "enrollments.json", room="lounge")
+    store = EnrollmentsStore(tmp_path / "enrollments.json", room="living_room")
     store.load()
     assert store.users == []
     assert store.has_enrollments is False
@@ -58,7 +58,7 @@ def test_store_load_missing_file_silent(tmp_path):
 
 def test_store_load_parses_users(tmp_path):
     payload = {
-        "version": 1, "room": "lounge", "threshold": 0.65,
+        "version": 1, "room": "living_room", "threshold": 0.65,
         "users": [{
             "user_id": "rob", "display_name": "Rob",
             "embeddings": [{"vec": _stub_vec(1), "captured_ts": "2026-05-15T10:00:00+01:00"}],
@@ -66,7 +66,7 @@ def test_store_load_parses_users(tmp_path):
     }
     p = tmp_path / "enrollments.json"
     p.write_text(json.dumps(payload))
-    store = EnrollmentsStore(p, room="lounge")
+    store = EnrollmentsStore(p, room="living_room")
     store.load()
     assert store.threshold == 0.65
     assert len(store.users) == 1
@@ -80,11 +80,11 @@ def test_store_load_corrupt_falls_back_to_bak(tmp_path):
     bak = tmp_path / "enrollments.json.bak"
     p.write_text("{ this is not json")
     bak.write_text(json.dumps({
-        "version": 1, "room": "lounge",
+        "version": 1, "room": "living_room",
         "users": [{"user_id": "rob", "display_name": "Rob",
                    "embeddings": [{"vec": _stub_vec(2), "captured_ts": ""}]}],
     }))
-    store = EnrollmentsStore(p, room="lounge")
+    store = EnrollmentsStore(p, room="living_room")
     store.load()
     assert len(store.users) == 1
     assert store.load_failed is False
@@ -95,7 +95,7 @@ def test_store_load_both_corrupt_marks_load_failed(tmp_path):
     bak = tmp_path / "enrollments.json.bak"
     p.write_text("garbage")
     bak.write_text("more garbage")
-    store = EnrollmentsStore(p, room="lounge")
+    store = EnrollmentsStore(p, room="living_room")
     store.load()
     assert store.load_failed is True
     assert store.users == []
@@ -103,7 +103,7 @@ def test_store_load_both_corrupt_marks_load_failed(tmp_path):
 
 def test_store_add_enrollment_persists(tmp_path):
     p = tmp_path / "enrollments.json"
-    store = EnrollmentsStore(p, room="lounge")
+    store = EnrollmentsStore(p, room="living_room")
     store.add_enrollment("rob", _stub_vec(3), display_name="Rob")
     assert p.exists()
     data = json.loads(p.read_text())
@@ -113,7 +113,7 @@ def test_store_add_enrollment_persists(tmp_path):
 
 def test_store_save_rotates_bak(tmp_path):
     p = tmp_path / "enrollments.json"
-    store = EnrollmentsStore(p, room="lounge")
+    store = EnrollmentsStore(p, room="living_room")
     store.add_enrollment("rob", _stub_vec(4))
     store.add_enrollment("rob", _stub_vec(5))
     assert (tmp_path / "enrollments.json.bak").exists()
@@ -121,7 +121,7 @@ def test_store_save_rotates_bak(tmp_path):
 
 def test_store_delete_enrollment(tmp_path):
     p = tmp_path / "enrollments.json"
-    store = EnrollmentsStore(p, room="lounge")
+    store = EnrollmentsStore(p, room="living_room")
     store.add_enrollment("rob", _stub_vec(6))
     store.add_enrollment("rob", _stub_vec(7))
     assert store.delete_enrollment("rob", 0)
@@ -135,7 +135,7 @@ def test_store_delete_enrollment(tmp_path):
 
 
 def test_verify_with_no_enrollments_returns_accept_all(tmp_path):
-    store = EnrollmentsStore(tmp_path / "x.json", room="lounge")
+    store = EnrollmentsStore(tmp_path / "x.json", room="living_room")
     verifier = SpeakerVerifier(store=store, model_path=None)
     result = verifier.verify(_silence_pcm())
     assert result.gate1_pass is True
@@ -144,7 +144,7 @@ def test_verify_with_no_enrollments_returns_accept_all(tmp_path):
 
 
 def test_verify_disabled_flag_short_circuits(tmp_path):
-    store = EnrollmentsStore(tmp_path / "x.json", room="lounge")
+    store = EnrollmentsStore(tmp_path / "x.json", room="living_room")
     store.add_enrollment("rob", _stub_vec(8))
     verifier = SpeakerVerifier(store=store, model_path=None, enabled=False)
     result = verifier.verify(_silence_pcm())
@@ -152,7 +152,7 @@ def test_verify_disabled_flag_short_circuits(tmp_path):
 
 
 def test_verify_missing_model_falls_back_to_accept_all(tmp_path):
-    store = EnrollmentsStore(tmp_path / "x.json", room="lounge")
+    store = EnrollmentsStore(tmp_path / "x.json", room="living_room")
     store.add_enrollment("rob", _stub_vec(9))
     verifier = SpeakerVerifier(store=store, model_path=tmp_path / "missing.onnx")
     result = verifier.verify(_silence_pcm())
@@ -167,7 +167,7 @@ def test_verify_missing_model_falls_back_to_accept_all(tmp_path):
 
 def _make_verifier_with_stub(tmp_path, embed_vec: List[float], *, gate1: bool = True):
     """Build a SpeakerVerifier with the ONNX path stubbed and Gate 1 forced."""
-    store = EnrollmentsStore(tmp_path / "x.json", room="lounge")
+    store = EnrollmentsStore(tmp_path / "x.json", room="living_room")
     verifier = SpeakerVerifier(store=store, model_path=None)
     # Pretend the model + VAD loaded successfully.
     verifier._init_attempted = True
@@ -231,14 +231,14 @@ def test_verify_matches_user_with_max_cosine(tmp_path):
 
 
 def test_outlier_check_first_sample_always_accepts(tmp_path):
-    store = EnrollmentsStore(tmp_path / "x.json", room="lounge")
+    store = EnrollmentsStore(tmp_path / "x.json", room="living_room")
     verifier = SpeakerVerifier(store=store, model_path=None)
     assert verifier.outlier_check("rob", _stub_vec(14)) is True
 
 
 def test_outlier_check_accepts_when_similar(tmp_path):
     base = _stub_vec(15)
-    store = EnrollmentsStore(tmp_path / "x.json", room="lounge")
+    store = EnrollmentsStore(tmp_path / "x.json", room="living_room")
     store.add_enrollment("rob", base)
     verifier = SpeakerVerifier(store=store, model_path=None)
     # Same vector trivially > 0.5.
@@ -246,7 +246,7 @@ def test_outlier_check_accepts_when_similar(tmp_path):
 
 
 def test_outlier_check_rejects_when_dissimilar(tmp_path):
-    store = EnrollmentsStore(tmp_path / "x.json", room="lounge")
+    store = EnrollmentsStore(tmp_path / "x.json", room="living_room")
     store.add_enrollment("rob", [1.0] + [0.0] * 511)
     verifier = SpeakerVerifier(store=store, model_path=None)
     # Orthogonal candidate (cosine 0) — below 0.5.

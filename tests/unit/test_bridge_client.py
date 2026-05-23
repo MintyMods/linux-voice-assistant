@@ -58,7 +58,7 @@ def test_chat_happy_path_parses_l1_response():
 
     async def run():
         return await client.chat(
-            device="lounge",
+            device="living_room",
             generation=142,
             session_id="sess-1",
             text="what time is it?",
@@ -78,7 +78,7 @@ def test_chat_happy_path_parses_l1_response():
 
     # Request body must include the L.1 required fields.
     sent_body = json.loads(seen[0].content.decode("utf-8"))
-    assert sent_body["device"] == "lounge"
+    assert sent_body["device"] == "living_room"
     assert sent_body["generation"] == 142
     assert sent_body["session_id"] == "sess-1"
     assert sent_body["text"] == "what time is it?"
@@ -98,7 +98,7 @@ def test_chat_408_raises_bridge_timeout():
     client = BridgeClient("http://bridge.test", transport=httpx.MockTransport(handler))
 
     async def run():
-        await client.chat(device="lounge", generation=142, session_id="sess-1", text="hi")
+        await client.chat(device="living_room", generation=142, session_id="sess-1", text="hi")
 
     try:
         with pytest.raises(BridgeTimeout) as exc:
@@ -120,7 +120,7 @@ def test_chat_409_raises_stale_generation():
     client = BridgeClient("http://bridge.test", transport=httpx.MockTransport(handler))
 
     async def run():
-        await client.chat(device="lounge", generation=142, session_id="sess-1", text="hi")
+        await client.chat(device="living_room", generation=142, session_id="sess-1", text="hi")
 
     try:
         with pytest.raises(StaleGeneration) as exc:
@@ -142,7 +142,7 @@ def test_chat_503_retries_once_then_raises_subprocess_unavailable():
     client = BridgeClient("http://bridge.test", transport=httpx.MockTransport(handler))
 
     async def run():
-        await client.chat(device="lounge", generation=142, session_id="sess-1", text="hi")
+        await client.chat(device="living_room", generation=142, session_id="sess-1", text="hi")
 
     try:
         with pytest.raises(SubprocessUnavailable) as exc:
@@ -165,7 +165,7 @@ def test_chat_503_then_200_succeeds_on_retry():
     client = BridgeClient("http://bridge.test", transport=httpx.MockTransport(handler))
 
     async def run():
-        return await client.chat(device="lounge", generation=142, session_id="sess-1", text="hi")
+        return await client.chat(device="living_room", generation=142, session_id="sess-1", text="hi")
 
     try:
         reply = _run(run())
@@ -183,7 +183,7 @@ def test_chat_500_raises_internal_error():
     client = BridgeClient("http://bridge.test", transport=httpx.MockTransport(handler))
 
     async def run():
-        await client.chat(device="lounge", generation=142, session_id="sess-1", text="hi")
+        await client.chat(device="living_room", generation=142, session_id="sess-1", text="hi")
 
     try:
         with pytest.raises(BridgeInternalError) as exc:
@@ -201,7 +201,7 @@ def test_chat_connect_timeout_maps_to_bridge_timeout():
     client = BridgeClient("http://bridge.test", transport=httpx.MockTransport(handler))
 
     async def run():
-        await client.chat(device="lounge", generation=142, session_id="sess-1", text="hi")
+        await client.chat(device="living_room", generation=142, session_id="sess-1", text="hi")
 
     try:
         with pytest.raises(BridgeTimeout) as exc:
@@ -217,7 +217,7 @@ def test_chat_connect_timeout_maps_to_bridge_timeout():
 def test_cancel_happy_path_parses_l2_response():
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8"))
-        assert body["device"] == "lounge"
+        assert body["device"] == "living_room"
         assert body["generation"] == 142
         assert body["reason"] == "RED_BUTTON_SOFT"
         return httpx.Response(200, json={
@@ -230,7 +230,7 @@ def test_cancel_happy_path_parses_l2_response():
     client = BridgeClient("http://bridge.test", transport=httpx.MockTransport(handler))
 
     async def run():
-        return await client.cancel(device="lounge", generation=142, reason="RED_BUTTON_SOFT")
+        return await client.cancel(device="living_room", generation=142, reason="RED_BUTTON_SOFT")
 
     try:
         result = _run(run())
@@ -249,7 +249,7 @@ def test_cancel_swallows_timeout_returns_cancelled_false():
     client = BridgeClient("http://bridge.test", transport=httpx.MockTransport(handler))
 
     async def run():
-        return await client.cancel(device="lounge", generation=142)
+        return await client.cancel(device="living_room", generation=142)
 
     try:
         result = _run(run())

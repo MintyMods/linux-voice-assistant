@@ -21,7 +21,7 @@ from linux_voice_assistant.ha_bridge import HABridge
 def _make_bridge(fake_paho):
     created, factory = fake_paho
     bridge = HABridge(
-        room="lounge",
+        room="living_room",
         host="mqtt.example",
         port=1883,
         client_factory=factory,

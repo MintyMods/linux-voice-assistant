@@ -16,9 +16,9 @@ def test_matrix_contains_required_topics():
 
 
 def test_expand_substitutes_room():
-    expanded = expand(K15_SUBSCRIPTION_MATRIX, "lounge")
+    expanded = expand(K15_SUBSCRIPTION_MATRIX, "living_room")
     topics = {s.topic for s in expanded}
-    assert "calisto/lounge/cancel" in topics
+    assert "calisto/living_room/cancel" in topics
     assert "calisto/all/cancel" in topics  # unchanged
     assert all("<room>" not in s.topic for s in expanded)
 

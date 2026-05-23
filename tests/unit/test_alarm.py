@@ -39,7 +39,7 @@ def alarm_setup(monkeypatch):
     controller = AlarmController(
         alarm_player=alarm_player,
         music_player=music_player,
-        room="lounge",
+        room="living_room",
         ha_bridge=bridge,
     )
     return controller, alarm_player, music_player, bridge
@@ -70,7 +70,7 @@ def test_set_alarm_plays_at_volume_and_publishes_state(alarm_setup):
     publishes = bridge._publishes
     assert len(publishes) == 1
     topic, body, qos, retain = publishes[0]
-    assert topic == "calisto/lounge/alarm/state"
+    assert topic == "calisto/living_room/alarm/state"
     assert qos == 1 and retain is True
     state = json.loads(body)
     assert state["ringing"] is True

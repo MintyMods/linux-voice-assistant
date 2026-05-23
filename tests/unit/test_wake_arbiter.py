@@ -37,7 +37,7 @@ class _FakePublisher:
         return True
 
 
-def _make(room: str = "lounge", wait_ms: int = 20, enabled: bool = True) -> Tuple[WakeArbiter, _FakePublisher]:
+def _make(room: str = "living_room", wait_ms: int = 20, enabled: bool = True) -> Tuple[WakeArbiter, _FakePublisher]:
     pub = _FakePublisher()
     arb = WakeArbiter(
         room=room,

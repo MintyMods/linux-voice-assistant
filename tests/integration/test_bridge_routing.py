@@ -88,7 +88,7 @@ class _FakeTTS:
             done_callback()
 
 
-def _make_state(room: str = "lounge"):
+def _make_state(room: str = "living_room"):
     from tests.conftest import make_server_state
     state = make_server_state()
     state.room = room
@@ -125,7 +125,7 @@ async def test_run_turn_routes_to_bridge_with_correct_device():
 @pytest.mark.asyncio
 async def test_run_turn_drops_reply_when_gen_moves_mid_chat():
     """§7.6 #3 — bridge slow + cancel mid-chat → reply silently dropped."""
-    state = _make_state(room="lounge")
+    state = _make_state(room="living_room")
     session = DeviceSession(state, ha_bridge=None)
     asr = _FakeASR()
     bridge = _FakeBridge(slow_s=0.05)  # short slowness for test speed
@@ -154,7 +154,7 @@ async def test_run_turn_drops_reply_when_gen_moves_mid_chat():
 @pytest.mark.asyncio
 async def test_run_turn_drops_when_gen_moves_after_asr():
     """Cancel during ASR → bridge never called."""
-    state = _make_state(room="lounge")
+    state = _make_state(room="living_room")
     session = DeviceSession(state, ha_bridge=None)
 
     class _SlowASR:

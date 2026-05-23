@@ -25,7 +25,7 @@ def _publisher(state=None, **kwargs):
     ha_bridge = MagicMock()
     ha_bridge.publish.return_value = True
     return HeartbeatPublisher(
-        state, ha_bridge=ha_bridge, room="lounge", **kwargs
+        state, ha_bridge=ha_bridge, room="living_room", **kwargs
     ), ha_bridge, state
 
 
@@ -82,10 +82,10 @@ def test_heartbeat_set_interval_clamps_to_range():
 
 def test_topic_uses_room():
     pub, ha, _ = _publisher()
-    assert pub.topic == "calisto/lounge/heartbeat"
+    assert pub.topic == "calisto/living_room/heartbeat"
     pub.publish_once()
     args, _ = ha.publish.call_args
-    assert args[0] == "calisto/lounge/heartbeat"
+    assert args[0] == "calisto/living_room/heartbeat"
 
 
 def test_mpv_channels_snapshot_reads_channel_status():
@@ -225,7 +225,7 @@ def test_publish_count_tracks_calls():
 
 def test_publish_no_op_when_ha_bridge_absent():
     state = make_server_state()
-    pub = HeartbeatPublisher(state, ha_bridge=None, room="lounge")
+    pub = HeartbeatPublisher(state, ha_bridge=None, room="living_room")
     assert pub.publish_once() is False
     assert pub.published_count == 0
 
@@ -242,7 +242,7 @@ async def test_bridge_ping_marks_reachable_on_first_ok():
     loop = asyncio.get_event_loop()
     pub = HeartbeatPublisher(
         state, ha_bridge=MagicMock(publish=MagicMock(return_value=True)),
-        room="lounge", bridge_ping_interval_s=0.01,
+        room="living_room", bridge_ping_interval_s=0.01,
     )
     pub.start(loop)
     await asyncio.sleep(0.05)
@@ -259,7 +259,7 @@ async def test_bridge_ping_three_strikes_marks_unreachable():
     loop = asyncio.get_event_loop()
     pub = HeartbeatPublisher(
         state, ha_bridge=MagicMock(publish=MagicMock(return_value=True)),
-        room="lounge", bridge_ping_interval_s=0.01, bridge_ping_strikes=3,
+        room="living_room", bridge_ping_interval_s=0.01, bridge_ping_strikes=3,
     )
     pub.start(loop)
     await asyncio.sleep(0.1)

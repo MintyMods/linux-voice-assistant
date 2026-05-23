@@ -16,7 +16,7 @@ from tests.conftest import make_server_state
 
 
 def _stub_verifier(tmp_path, *, embed_vec=None, outlier_pass=True):
-    store = EnrollmentsStore(tmp_path / "enrollments.json", room="lounge")
+    store = EnrollmentsStore(tmp_path / "enrollments.json", room="living_room")
     verifier = SpeakerVerifier(store=store, model_path=None)
     verifier.embed = MagicMock(return_value=list(embed_vec) if embed_vec is not None else [0.1] * 512)
     verifier.outlier_check = MagicMock(return_value=outlier_pass)
@@ -25,7 +25,7 @@ def _stub_verifier(tmp_path, *, embed_vec=None, outlier_pass=True):
 
 def _make_state(tmp_path, verifier=None, wake_capture=None):
     state = make_server_state()
-    state.room = "lounge"
+    state.room = "living_room"
     state.speaker_verifier = verifier
     state.wake_capture = wake_capture or MagicMock(
         snapshot_recent_pcm=MagicMock(return_value=b"\x00\x00" * 24000),

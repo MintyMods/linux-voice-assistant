@@ -68,7 +68,7 @@ def clock():
 def _make_wc(capture_dir: Path, clock, *, max_files: int = 5000, orphan: float = 60.0) -> WakeCapture:
     return WakeCapture(
         capture_dir=capture_dir,
-        room="lounge",
+        room="living_room",
         device_id="minty-test-01",
         max_files=max_files,
         orphan_timeout_s=orphan,
@@ -120,7 +120,7 @@ def test_on_wake_fire_writes_wav_and_sidecar(capture_dir, clock):
     with open(sidecars[0]) as f:
         data = json.load(f)
     assert data["version"] == 1
-    assert data["room"] == "lounge"
+    assert data["room"] == "living_room"
     assert data["device_id"] == "minty-test-01"
     assert data["score"] == 0.87
     assert data["model"] == "alexa.tflite"

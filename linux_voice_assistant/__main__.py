@@ -775,7 +775,7 @@ def _start_stage_b_components(state: ServerState, loop: asyncio.AbstractEventLoo
                 loop=loop,
                 on_speech_captured=session.on_speech_captured,
             )
-            _LOGGER.warning("MicCapture initialised — v1 audio path ACTIVE (lounge no longer streams to HA)")
+            _LOGGER.warning("MicCapture initialised — v1 audio path ACTIVE (LVA no longer streams to HA)")
         except RuntimeError as exc:
             _LOGGER.error("MicCapture refused to wire (%s); v1 audio path DISABLED, v0 HA-streaming retained", exc)
         except Exception:
