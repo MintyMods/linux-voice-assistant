@@ -228,6 +228,9 @@ class LedController:
         """
         from ..session import State  # local import to avoid cycle at module load
 
+        # DIAG (idle-reset hunt 2026-05-23): log entry so we can attribute
+        # the 30s phone.off() cycle to either on_state or apply_legacy.
+        _LOGGER.debug("on_state called: new_state=%s cancel_reason=%s", new_state, cancel_reason)
         with self._state_lock:
             self._last_state = new_state
             if self._muted:
@@ -272,6 +275,8 @@ class LedController:
         unmute toggle the private state via the same path the hardware
         button uses.
         """
+        # DIAG (idle-reset hunt 2026-05-23): log every MQTT-driven LED command.
+        _LOGGER.debug("apply_legacy called: payload=%r", payload)
         normalised = payload.strip().lower()
         if normalised == "mute":
             self.set_private(True, source="mqtt")

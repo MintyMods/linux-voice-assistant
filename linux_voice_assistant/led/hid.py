@@ -181,6 +181,23 @@ class HidWriter:
                 len(payloads),
             )
             return False
+        # DIAG (idle-reset hunt 2026-05-23): every successful HID write
+        # must be visible to correlate with observed LED flickers. Walk
+        # past any in-file wrappers (write_one) so the logged caller is
+        # the real driving site.
+        import sys as _sys
+        _f = _sys._getframe(1)
+        while _f is not None and _f.f_code.co_filename.endswith('/hid.py'):
+            _f = _f.f_back
+        _caller = (
+            f"{_f.f_code.co_filename.rsplit('/', 1)[-1]}:{_f.f_lineno}"
+            if _f is not None else "?"
+        )
+        _LOGGER.debug(
+            "HID write_seq caller=%s payloads=%s",
+            _caller,
+            [list(p) for p in payloads],
+        )
         with self._lock:
             try:
                 with open(dev, "wb", buffering=0) as fh:
